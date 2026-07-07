@@ -1,0 +1,16 @@
+[package]
+name = "bls381-bench-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[dev-dependencies]
+bls381-bench = { path = "../program" }
+mollusk-svm = "=0.13.4"
+solana-instruction = "3"
+solana-pubkey = "4"
+bls12_381 = { version = "0.8.0", features = ["experimental"] }
+sha2 = "0.9"
+blst = "0.3"
+hex = "0.4"

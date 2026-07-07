@@ -1,0 +1,14 @@
+[package]
+name = "bls381-bench"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "bls381_bench"
+
+[dependencies]
+solana-program = "=4.0.0"
+solana-define-syscall = "4.0.1"
+bls12_381 = { version = "0.8.0", default-features = false, features = ["groups", "experimental"] }
+sha2 = { version = "0.9", default-features = false }
