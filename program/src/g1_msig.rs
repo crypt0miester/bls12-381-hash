@@ -956,6 +956,16 @@ pub mod witness {
         limbs_to_be(&pow_mont(v_m, &exp_inverse()))
     }
 
+    // The other square root of gx: an equally valid witness that the sign
+    // correction must resolve to the same output point.
+    pub fn flip_first_sqrt(blob: &[u8]) -> Vec<u8> {
+        let y = wit48(&blob[49..97]).unwrap();
+        let mut out = blob[..49].to_vec();
+        out.extend_from_slice(&limbs_to_be(&neg_mod(&y)));
+        out.extend_from_slice(&blob[97..]);
+        out
+    }
+
     pub fn generate_nu(msg: &[u8]) -> Vec<u8> {
         let elem = hash_to_field_nu(msg);
         let (blob_map, point) = map_blob(&elem);

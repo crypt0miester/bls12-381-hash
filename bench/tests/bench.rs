@@ -511,6 +511,103 @@ fn bench_witness_hash_to_g2() {
     assert!(rejected.program_result.is_err(), "corrupt witness was accepted");
 }
 
+// No witness byte can steer the output: every single-bit corruption of the G2
+// witness must abort or reproduce the exact same point. Also covers the branch
+// flag range, canonical-form parsing, and message binding.
+#[test]
+fn witness_g2_soundness() {
+    let mollusk = mollusk();
+
+    let witness = bls381_bench::g2_msig::witness::generate(MESSAGE);
+    let mut payload = witness.clone();
+    payload.extend_from_slice(MESSAGE);
+
+    let good = run(&mollusk, 41, &payload);
+    assert!(!good.program_result.is_err(), "honest witness rejected");
+    let truth = good.return_data.clone();
+
+    for i in 0..witness.len() {
+        let mut bad = payload.clone();
+        bad[i] ^= 1;
+        let r = run(&mollusk, 41, &bad);
+        if !r.program_result.is_err() {
+            assert_eq!(r.return_data, truth, "witness byte {i} steered the output");
+        }
+    }
+
+    // a branch flag above 1 is non-canonical
+    for flag in [0usize, 97] {
+        let mut bad = payload.clone();
+        bad[flag] = 2;
+        assert!(run(&mollusk, 41, &bad).program_result.is_err(), "flag=2 at {flag} accepted");
+    }
+
+    // a witness limb at or above the modulus must be rejected by the parser
+    let mut oob = payload.clone();
+    for byte in oob[1..49].iter_mut() {
+        *byte = 0xff;
+    }
+    assert!(run(&mollusk, 41, &oob).program_result.is_err(), "out-of-range witness accepted");
+
+    // the witness is bound to the message it was generated for
+    let mut replay = witness.clone();
+    replay.extend_from_slice(b"a different snapshot vote payload");
+    assert!(run(&mollusk, 41, &replay).program_result.is_err(), "cross-message replay accepted");
+
+    // the other square root is an equally valid witness and must not steer
+    let mut alt = bls381_bench::g2_msig::witness::flip_first_sqrt(&witness);
+    alt.extend_from_slice(MESSAGE);
+    let same = run(&mollusk, 41, &alt);
+    assert!(!same.program_result.is_err(), "flipped root rejected");
+    assert_eq!(same.return_data, truth, "flipped root changed the point");
+}
+
+// The G1 (min-sig) counterpart of the G2 soundness sweep.
+#[test]
+fn witness_g1_soundness() {
+    let mollusk = mollusk();
+
+    let witness = bls381_bench::g1_msig::witness::generate(MESSAGE);
+    let mut payload = witness.clone();
+    payload.extend_from_slice(MESSAGE);
+
+    let good = run(&mollusk, 40, &payload);
+    assert!(!good.program_result.is_err(), "honest witness rejected");
+    let truth = good.return_data.clone();
+
+    for i in 0..witness.len() {
+        let mut bad = payload.clone();
+        bad[i] ^= 1;
+        let r = run(&mollusk, 40, &bad);
+        if !r.program_result.is_err() {
+            assert_eq!(r.return_data, truth, "witness byte {i} steered the output");
+        }
+    }
+
+    for flag in [0usize, 97] {
+        let mut bad = payload.clone();
+        bad[flag] = 2;
+        assert!(run(&mollusk, 40, &bad).program_result.is_err(), "flag=2 at {flag} accepted");
+    }
+
+    let mut oob = payload.clone();
+    for byte in oob[1..49].iter_mut() {
+        *byte = 0xff;
+    }
+    assert!(run(&mollusk, 40, &oob).program_result.is_err(), "out-of-range witness accepted");
+
+    let mut replay = witness.clone();
+    replay.extend_from_slice(b"a different snapshot vote payload");
+    assert!(run(&mollusk, 40, &replay).program_result.is_err(), "cross-message replay accepted");
+
+    // the other square root is an equally valid witness and must not steer
+    let mut alt = bls381_bench::g1_msig::witness::flip_first_sqrt(&witness);
+    alt.extend_from_slice(MESSAGE);
+    let same = run(&mollusk, 40, &alt);
+    assert!(!same.program_result.is_err(), "flipped root rejected");
+    assert_eq!(same.return_data, truth, "flipped root changed the point");
+}
+
 #[test]
 fn bench_witness_svdw_hash_to_g2() {
     use bls12_381::hash_to_curve::MapToCurve;
