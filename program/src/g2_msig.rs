@@ -12,8 +12,8 @@ use solana_program::program_error::ProgramError;
 
 use crate::g1_consts::R;
 use crate::g1_msig::{
-    add_mod, be_to_limbs, from_mont, is_zero, limbs_to_be, mont_mul, mul_wide32, neg_mod,
-    reduce_wide32, sub_mod, sys, to_mont, wide_add, wide_sub, wit48, Fp, P2_WIDE, TWO_P2_WIDE,
+    add_mod, be_to_limbs, from_mont, is_zero, limbs_to_be, mont_mul, neg_mod, sub_mod, sys,
+    to_mont, wit48, Fp,
 };
 use crate::g2_consts::{
     C256_MONT, ISO3A_XDEN, ISO3A_XNUM, ISO3A_YDEN, ISO3A_YNUM, ISO3_XDEN, ISO3_YDEN,
@@ -74,28 +74,6 @@ pub(crate) fn mul2(a: &Fp2, b: &Fp2) -> Fp2 {
     }
 }
 
-/// Delayed-reduction variant: three wide products, two Montgomery
-/// reductions instead of three. Measured SLOWER than the interleaved
-/// version above (+0.5% on the G2 pipeline) even with 17% fewer
-/// multiply-accumulates; the separate wide passes cost more than the
-/// saved reduction. Kept as the measurement that also rules out
-/// base-field Karatsuba, which restructures for a smaller saving.
-#[allow(dead_code)]
-fn mul2_lazy(a: &Fp2, b: &Fp2) -> Fp2 {
-    let t0 = mul_wide32(&a.c0, &b.c0);
-    let t1 = mul_wide32(&a.c1, &b.c1);
-    let sa = add_mod(&a.c0, &a.c1);
-    let sb = add_mod(&b.c0, &b.c1);
-    let t2 = mul_wide32(&sa, &sb);
-    let mut c0 = wide_sub(&wide_add(&t0, &P2_WIDE), &t1);
-    // sa and sb are mod-reduced, so the integer t2 can undershoot
-    // t0 + t1; offset by 2 p^2 to stay non-negative
-    let mut c1 = wide_sub(&wide_add(&t2, &TWO_P2_WIDE), &wide_add(&t0, &t1));
-    Fp2 {
-        c0: reduce_wide32(&mut c0),
-        c1: reduce_wide32(&mut c1),
-    }
-}
 
 pub(crate) fn sq2(a: &Fp2) -> Fp2 {
     let s = add_mod(&a.c0, &a.c1);
@@ -290,13 +268,16 @@ fn sswu_finish(
     if sq2(&yw_m) != gx {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let mut y_canonical = *y_w;
 
-    if sgn0_fp2(&y_canonical) != sgn0_fp2(&u.canonical) {
-        y_canonical = neg2(&y_canonical);
-    }
+    // Negation commutes with the Montgomery map, so flip the square root we
+    // already converted rather than converting the canonical value a second time.
+    let y = if sgn0_fp2(y_w) != sgn0_fp2(&u.canonical) {
+        neg2(&yw_m)
+    } else {
+        yw_m
+    };
 
-    Ok(Point2 { x, y: to_mont2(&y_canonical) })
+    Ok(Point2 { x, y })
 }
 
 pub(crate) fn add_prime_witnessed(p: &Point2, q: &Point2, w_dx: &Fp2) -> Result<Point2, ProgramError> {

@@ -132,95 +132,12 @@ pub(crate) fn mont_mul(a: &Fp, b: &Fp) -> Fp {
     mont_mul_cios32(a, b)
 }
 
-/// Squaring entry point. the specialized SOS squaring 
-/// below measures SLOWER on sBPF (4.3k vs 3.4k CU)
+/// Square through the general multiply; a dedicated squaring does not
+/// pay for itself on sbpf.
 pub(crate) fn mont_sqr(a: &Fp) -> Fp {
     mont_mul_cios32(a, a)
 }
 
-/// Squaring with 32-bit limbs: cross products computed once and doubled,
-/// then a standard Montgomery reduction pass. 
-fn mont_sqr_sos32(a: &Fp) -> Fp {
-    let mut a32 = [0u64; 12];
-    let mut p32 = [0u64; 12];
-    for i in 0..6 {
-        a32[i * 2] = a[i] & 0xffff_ffff;
-        a32[i * 2 + 1] = a[i] >> 32;
-        p32[i * 2] = MODULUS[i] & 0xffff_ffff;
-        p32[i * 2 + 1] = MODULUS[i] >> 32;
-    }
-
-    // 32-bit lanes of the 768-bit square, kept normalized per row
-    let mut t = [0u64; 25];
-    for i in 0..12 {
-        let ai = a32[i];
-        let mut carry = 0u64;
-        for j in (i + 1)..12 {
-            let (lo, hi) = mac32(t[i + j], ai, a32[j], carry);
-            t[i + j] = lo;
-            carry = hi;
-        }
-        let mut k = i + 12;
-        let mut c = carry;
-        while c != 0 && k < 24 {
-            let v = t[k] + c;
-            t[k] = v & 0xffff_ffff;
-            c = v >> 32;
-            k += 1;
-        }
-        t[24] += c;
-    }
-
-    // double the cross products
-    let mut c = 0u64;
-    for lane in t.iter_mut().take(24) {
-        let v = (*lane << 1) | c;
-        *lane = v & 0xffff_ffff;
-        c = v >> 32;
-    }
-    t[24] += c;
-
-    // diagonal terms
-    let mut c = 0u64;
-    for i in 0..12 {
-        let d = a32[i] * a32[i];
-        let v = t[2 * i] + (d & 0xffff_ffff) + c;
-        t[2 * i] = v & 0xffff_ffff;
-        let v2 = t[2 * i + 1] + (d >> 32) + (v >> 32);
-        t[2 * i + 1] = v2 & 0xffff_ffff;
-        c = v2 >> 32;
-    }
-    t[24] += c;
-
-    // Montgomery reduction, SOS shape
-    for i in 0..12 {
-        let m = t[i].wrapping_mul(INV32) & 0xffff_ffff;
-        let mut carry = 0u64;
-        for j in 0..12 {
-            let (lo, hi) = mac32(t[i + j], m, p32[j], carry);
-            t[i + j] = lo;
-            carry = hi;
-        }
-        let mut k = i + 12;
-        let mut c = carry;
-        while c != 0 && k < 24 {
-            let v = t[k] + c;
-            t[k] = v & 0xffff_ffff;
-            c = v >> 32;
-            k += 1;
-        }
-        t[24] += c;
-    }
-
-    let mut r = [0u64; 6];
-    for i in 0..6 {
-        r[i] = t[12 + i * 2] | (t[12 + i * 2 + 1] << 32);
-    }
-    if t[24] != 0 || geq(&r, &MODULUS) {
-        r = sub_nocheck(&r, &MODULUS);
-    }
-    r
-}
 
 pub(crate) fn to_mont(a: &Fp) -> Fp {
     mont_mul(a, &R2)
@@ -666,606 +583,6 @@ pub fn run(stage: u8, msg: &[u8]) -> Result<Vec<u8>, ProgramError> {
 }
 
 
-/// Fully unrolled 32-bit CIOS: constant indices elide bounds checks,
-/// modulus limbs are immediates, loop control disappears.
-#[rustfmt::skip]
-fn mont_mul_cios32_unrolled(a: &Fp, b: &Fp) -> Fp {
-    const M: u64 = 0xffff_ffff;
-    let a0 = a[0] & M; let a1 = a[0] >> 32;
-    let b0 = b[0] & M; let b1 = b[0] >> 32;
-    let a2 = a[1] & M; let a3 = a[1] >> 32;
-    let b2 = b[1] & M; let b3 = b[1] >> 32;
-    let a4 = a[2] & M; let a5 = a[2] >> 32;
-    let b4 = b[2] & M; let b5 = b[2] >> 32;
-    let a6 = a[3] & M; let a7 = a[3] >> 32;
-    let b6 = b[3] & M; let b7 = b[3] >> 32;
-    let a8 = a[4] & M; let a9 = a[4] >> 32;
-    let b8 = b[4] & M; let b9 = b[4] >> 32;
-    let a10 = a[5] & M; let a11 = a[5] >> 32;
-    let b10 = b[5] & M; let b11 = b[5] >> 32;
-    let mut t = [0u64; 14];
-    // round 0
-    let mut c = 0u64;
-    let v = t[0] + a0 * b0 + c; t[0] = v & M; c = v >> 32;
-    let v = t[1] + a0 * b1 + c; t[1] = v & M; c = v >> 32;
-    let v = t[2] + a0 * b2 + c; t[2] = v & M; c = v >> 32;
-    let v = t[3] + a0 * b3 + c; t[3] = v & M; c = v >> 32;
-    let v = t[4] + a0 * b4 + c; t[4] = v & M; c = v >> 32;
-    let v = t[5] + a0 * b5 + c; t[5] = v & M; c = v >> 32;
-    let v = t[6] + a0 * b6 + c; t[6] = v & M; c = v >> 32;
-    let v = t[7] + a0 * b7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[8] + a0 * b8 + c; t[8] = v & M; c = v >> 32;
-    let v = t[9] + a0 * b9 + c; t[9] = v & M; c = v >> 32;
-    let v = t[10] + a0 * b10 + c; t[10] = v & M; c = v >> 32;
-    let v = t[11] + a0 * b11 + c; t[11] = v & M; c = v >> 32;
-    let s = t[12] + c; t[12] = s & M; t[13] = s >> 32;
-    let m = (t[0].wrapping_mul(0xfffcfffd)) & M;
-    let v = t[0] + m * 0xffffaaab; let mut c = v >> 32;
-    let v = t[1] + m * 0xb9feffff + c; t[0] = v & M; c = v >> 32;
-    let v = t[2] + m * 0xb153ffff + c; t[1] = v & M; c = v >> 32;
-    let v = t[3] + m * 0x1eabfffe + c; t[2] = v & M; c = v >> 32;
-    let v = t[4] + m * 0xf6b0f624 + c; t[3] = v & M; c = v >> 32;
-    let v = t[5] + m * 0x6730d2a0 + c; t[4] = v & M; c = v >> 32;
-    let v = t[6] + m * 0xf38512bf + c; t[5] = v & M; c = v >> 32;
-    let v = t[7] + m * 0x64774b84 + c; t[6] = v & M; c = v >> 32;
-    let v = t[8] + m * 0x434bacd7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[9] + m * 0x4b1ba7b6 + c; t[8] = v & M; c = v >> 32;
-    let v = t[10] + m * 0x397fe69a + c; t[9] = v & M; c = v >> 32;
-    let v = t[11] + m * 0x1a0111ea + c; t[10] = v & M; c = v >> 32;
-    let s = t[12] + c; t[11] = s & M; t[12] = t[13] + (s >> 32); t[13] = 0;
-    // round 1
-    let mut c = 0u64;
-    let v = t[0] + a1 * b0 + c; t[0] = v & M; c = v >> 32;
-    let v = t[1] + a1 * b1 + c; t[1] = v & M; c = v >> 32;
-    let v = t[2] + a1 * b2 + c; t[2] = v & M; c = v >> 32;
-    let v = t[3] + a1 * b3 + c; t[3] = v & M; c = v >> 32;
-    let v = t[4] + a1 * b4 + c; t[4] = v & M; c = v >> 32;
-    let v = t[5] + a1 * b5 + c; t[5] = v & M; c = v >> 32;
-    let v = t[6] + a1 * b6 + c; t[6] = v & M; c = v >> 32;
-    let v = t[7] + a1 * b7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[8] + a1 * b8 + c; t[8] = v & M; c = v >> 32;
-    let v = t[9] + a1 * b9 + c; t[9] = v & M; c = v >> 32;
-    let v = t[10] + a1 * b10 + c; t[10] = v & M; c = v >> 32;
-    let v = t[11] + a1 * b11 + c; t[11] = v & M; c = v >> 32;
-    let s = t[12] + c; t[12] = s & M; t[13] = s >> 32;
-    let m = (t[0].wrapping_mul(0xfffcfffd)) & M;
-    let v = t[0] + m * 0xffffaaab; let mut c = v >> 32;
-    let v = t[1] + m * 0xb9feffff + c; t[0] = v & M; c = v >> 32;
-    let v = t[2] + m * 0xb153ffff + c; t[1] = v & M; c = v >> 32;
-    let v = t[3] + m * 0x1eabfffe + c; t[2] = v & M; c = v >> 32;
-    let v = t[4] + m * 0xf6b0f624 + c; t[3] = v & M; c = v >> 32;
-    let v = t[5] + m * 0x6730d2a0 + c; t[4] = v & M; c = v >> 32;
-    let v = t[6] + m * 0xf38512bf + c; t[5] = v & M; c = v >> 32;
-    let v = t[7] + m * 0x64774b84 + c; t[6] = v & M; c = v >> 32;
-    let v = t[8] + m * 0x434bacd7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[9] + m * 0x4b1ba7b6 + c; t[8] = v & M; c = v >> 32;
-    let v = t[10] + m * 0x397fe69a + c; t[9] = v & M; c = v >> 32;
-    let v = t[11] + m * 0x1a0111ea + c; t[10] = v & M; c = v >> 32;
-    let s = t[12] + c; t[11] = s & M; t[12] = t[13] + (s >> 32); t[13] = 0;
-    // round 2
-    let mut c = 0u64;
-    let v = t[0] + a2 * b0 + c; t[0] = v & M; c = v >> 32;
-    let v = t[1] + a2 * b1 + c; t[1] = v & M; c = v >> 32;
-    let v = t[2] + a2 * b2 + c; t[2] = v & M; c = v >> 32;
-    let v = t[3] + a2 * b3 + c; t[3] = v & M; c = v >> 32;
-    let v = t[4] + a2 * b4 + c; t[4] = v & M; c = v >> 32;
-    let v = t[5] + a2 * b5 + c; t[5] = v & M; c = v >> 32;
-    let v = t[6] + a2 * b6 + c; t[6] = v & M; c = v >> 32;
-    let v = t[7] + a2 * b7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[8] + a2 * b8 + c; t[8] = v & M; c = v >> 32;
-    let v = t[9] + a2 * b9 + c; t[9] = v & M; c = v >> 32;
-    let v = t[10] + a2 * b10 + c; t[10] = v & M; c = v >> 32;
-    let v = t[11] + a2 * b11 + c; t[11] = v & M; c = v >> 32;
-    let s = t[12] + c; t[12] = s & M; t[13] = s >> 32;
-    let m = (t[0].wrapping_mul(0xfffcfffd)) & M;
-    let v = t[0] + m * 0xffffaaab; let mut c = v >> 32;
-    let v = t[1] + m * 0xb9feffff + c; t[0] = v & M; c = v >> 32;
-    let v = t[2] + m * 0xb153ffff + c; t[1] = v & M; c = v >> 32;
-    let v = t[3] + m * 0x1eabfffe + c; t[2] = v & M; c = v >> 32;
-    let v = t[4] + m * 0xf6b0f624 + c; t[3] = v & M; c = v >> 32;
-    let v = t[5] + m * 0x6730d2a0 + c; t[4] = v & M; c = v >> 32;
-    let v = t[6] + m * 0xf38512bf + c; t[5] = v & M; c = v >> 32;
-    let v = t[7] + m * 0x64774b84 + c; t[6] = v & M; c = v >> 32;
-    let v = t[8] + m * 0x434bacd7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[9] + m * 0x4b1ba7b6 + c; t[8] = v & M; c = v >> 32;
-    let v = t[10] + m * 0x397fe69a + c; t[9] = v & M; c = v >> 32;
-    let v = t[11] + m * 0x1a0111ea + c; t[10] = v & M; c = v >> 32;
-    let s = t[12] + c; t[11] = s & M; t[12] = t[13] + (s >> 32); t[13] = 0;
-    // round 3
-    let mut c = 0u64;
-    let v = t[0] + a3 * b0 + c; t[0] = v & M; c = v >> 32;
-    let v = t[1] + a3 * b1 + c; t[1] = v & M; c = v >> 32;
-    let v = t[2] + a3 * b2 + c; t[2] = v & M; c = v >> 32;
-    let v = t[3] + a3 * b3 + c; t[3] = v & M; c = v >> 32;
-    let v = t[4] + a3 * b4 + c; t[4] = v & M; c = v >> 32;
-    let v = t[5] + a3 * b5 + c; t[5] = v & M; c = v >> 32;
-    let v = t[6] + a3 * b6 + c; t[6] = v & M; c = v >> 32;
-    let v = t[7] + a3 * b7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[8] + a3 * b8 + c; t[8] = v & M; c = v >> 32;
-    let v = t[9] + a3 * b9 + c; t[9] = v & M; c = v >> 32;
-    let v = t[10] + a3 * b10 + c; t[10] = v & M; c = v >> 32;
-    let v = t[11] + a3 * b11 + c; t[11] = v & M; c = v >> 32;
-    let s = t[12] + c; t[12] = s & M; t[13] = s >> 32;
-    let m = (t[0].wrapping_mul(0xfffcfffd)) & M;
-    let v = t[0] + m * 0xffffaaab; let mut c = v >> 32;
-    let v = t[1] + m * 0xb9feffff + c; t[0] = v & M; c = v >> 32;
-    let v = t[2] + m * 0xb153ffff + c; t[1] = v & M; c = v >> 32;
-    let v = t[3] + m * 0x1eabfffe + c; t[2] = v & M; c = v >> 32;
-    let v = t[4] + m * 0xf6b0f624 + c; t[3] = v & M; c = v >> 32;
-    let v = t[5] + m * 0x6730d2a0 + c; t[4] = v & M; c = v >> 32;
-    let v = t[6] + m * 0xf38512bf + c; t[5] = v & M; c = v >> 32;
-    let v = t[7] + m * 0x64774b84 + c; t[6] = v & M; c = v >> 32;
-    let v = t[8] + m * 0x434bacd7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[9] + m * 0x4b1ba7b6 + c; t[8] = v & M; c = v >> 32;
-    let v = t[10] + m * 0x397fe69a + c; t[9] = v & M; c = v >> 32;
-    let v = t[11] + m * 0x1a0111ea + c; t[10] = v & M; c = v >> 32;
-    let s = t[12] + c; t[11] = s & M; t[12] = t[13] + (s >> 32); t[13] = 0;
-    // round 4
-    let mut c = 0u64;
-    let v = t[0] + a4 * b0 + c; t[0] = v & M; c = v >> 32;
-    let v = t[1] + a4 * b1 + c; t[1] = v & M; c = v >> 32;
-    let v = t[2] + a4 * b2 + c; t[2] = v & M; c = v >> 32;
-    let v = t[3] + a4 * b3 + c; t[3] = v & M; c = v >> 32;
-    let v = t[4] + a4 * b4 + c; t[4] = v & M; c = v >> 32;
-    let v = t[5] + a4 * b5 + c; t[5] = v & M; c = v >> 32;
-    let v = t[6] + a4 * b6 + c; t[6] = v & M; c = v >> 32;
-    let v = t[7] + a4 * b7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[8] + a4 * b8 + c; t[8] = v & M; c = v >> 32;
-    let v = t[9] + a4 * b9 + c; t[9] = v & M; c = v >> 32;
-    let v = t[10] + a4 * b10 + c; t[10] = v & M; c = v >> 32;
-    let v = t[11] + a4 * b11 + c; t[11] = v & M; c = v >> 32;
-    let s = t[12] + c; t[12] = s & M; t[13] = s >> 32;
-    let m = (t[0].wrapping_mul(0xfffcfffd)) & M;
-    let v = t[0] + m * 0xffffaaab; let mut c = v >> 32;
-    let v = t[1] + m * 0xb9feffff + c; t[0] = v & M; c = v >> 32;
-    let v = t[2] + m * 0xb153ffff + c; t[1] = v & M; c = v >> 32;
-    let v = t[3] + m * 0x1eabfffe + c; t[2] = v & M; c = v >> 32;
-    let v = t[4] + m * 0xf6b0f624 + c; t[3] = v & M; c = v >> 32;
-    let v = t[5] + m * 0x6730d2a0 + c; t[4] = v & M; c = v >> 32;
-    let v = t[6] + m * 0xf38512bf + c; t[5] = v & M; c = v >> 32;
-    let v = t[7] + m * 0x64774b84 + c; t[6] = v & M; c = v >> 32;
-    let v = t[8] + m * 0x434bacd7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[9] + m * 0x4b1ba7b6 + c; t[8] = v & M; c = v >> 32;
-    let v = t[10] + m * 0x397fe69a + c; t[9] = v & M; c = v >> 32;
-    let v = t[11] + m * 0x1a0111ea + c; t[10] = v & M; c = v >> 32;
-    let s = t[12] + c; t[11] = s & M; t[12] = t[13] + (s >> 32); t[13] = 0;
-    // round 5
-    let mut c = 0u64;
-    let v = t[0] + a5 * b0 + c; t[0] = v & M; c = v >> 32;
-    let v = t[1] + a5 * b1 + c; t[1] = v & M; c = v >> 32;
-    let v = t[2] + a5 * b2 + c; t[2] = v & M; c = v >> 32;
-    let v = t[3] + a5 * b3 + c; t[3] = v & M; c = v >> 32;
-    let v = t[4] + a5 * b4 + c; t[4] = v & M; c = v >> 32;
-    let v = t[5] + a5 * b5 + c; t[5] = v & M; c = v >> 32;
-    let v = t[6] + a5 * b6 + c; t[6] = v & M; c = v >> 32;
-    let v = t[7] + a5 * b7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[8] + a5 * b8 + c; t[8] = v & M; c = v >> 32;
-    let v = t[9] + a5 * b9 + c; t[9] = v & M; c = v >> 32;
-    let v = t[10] + a5 * b10 + c; t[10] = v & M; c = v >> 32;
-    let v = t[11] + a5 * b11 + c; t[11] = v & M; c = v >> 32;
-    let s = t[12] + c; t[12] = s & M; t[13] = s >> 32;
-    let m = (t[0].wrapping_mul(0xfffcfffd)) & M;
-    let v = t[0] + m * 0xffffaaab; let mut c = v >> 32;
-    let v = t[1] + m * 0xb9feffff + c; t[0] = v & M; c = v >> 32;
-    let v = t[2] + m * 0xb153ffff + c; t[1] = v & M; c = v >> 32;
-    let v = t[3] + m * 0x1eabfffe + c; t[2] = v & M; c = v >> 32;
-    let v = t[4] + m * 0xf6b0f624 + c; t[3] = v & M; c = v >> 32;
-    let v = t[5] + m * 0x6730d2a0 + c; t[4] = v & M; c = v >> 32;
-    let v = t[6] + m * 0xf38512bf + c; t[5] = v & M; c = v >> 32;
-    let v = t[7] + m * 0x64774b84 + c; t[6] = v & M; c = v >> 32;
-    let v = t[8] + m * 0x434bacd7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[9] + m * 0x4b1ba7b6 + c; t[8] = v & M; c = v >> 32;
-    let v = t[10] + m * 0x397fe69a + c; t[9] = v & M; c = v >> 32;
-    let v = t[11] + m * 0x1a0111ea + c; t[10] = v & M; c = v >> 32;
-    let s = t[12] + c; t[11] = s & M; t[12] = t[13] + (s >> 32); t[13] = 0;
-    // round 6
-    let mut c = 0u64;
-    let v = t[0] + a6 * b0 + c; t[0] = v & M; c = v >> 32;
-    let v = t[1] + a6 * b1 + c; t[1] = v & M; c = v >> 32;
-    let v = t[2] + a6 * b2 + c; t[2] = v & M; c = v >> 32;
-    let v = t[3] + a6 * b3 + c; t[3] = v & M; c = v >> 32;
-    let v = t[4] + a6 * b4 + c; t[4] = v & M; c = v >> 32;
-    let v = t[5] + a6 * b5 + c; t[5] = v & M; c = v >> 32;
-    let v = t[6] + a6 * b6 + c; t[6] = v & M; c = v >> 32;
-    let v = t[7] + a6 * b7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[8] + a6 * b8 + c; t[8] = v & M; c = v >> 32;
-    let v = t[9] + a6 * b9 + c; t[9] = v & M; c = v >> 32;
-    let v = t[10] + a6 * b10 + c; t[10] = v & M; c = v >> 32;
-    let v = t[11] + a6 * b11 + c; t[11] = v & M; c = v >> 32;
-    let s = t[12] + c; t[12] = s & M; t[13] = s >> 32;
-    let m = (t[0].wrapping_mul(0xfffcfffd)) & M;
-    let v = t[0] + m * 0xffffaaab; let mut c = v >> 32;
-    let v = t[1] + m * 0xb9feffff + c; t[0] = v & M; c = v >> 32;
-    let v = t[2] + m * 0xb153ffff + c; t[1] = v & M; c = v >> 32;
-    let v = t[3] + m * 0x1eabfffe + c; t[2] = v & M; c = v >> 32;
-    let v = t[4] + m * 0xf6b0f624 + c; t[3] = v & M; c = v >> 32;
-    let v = t[5] + m * 0x6730d2a0 + c; t[4] = v & M; c = v >> 32;
-    let v = t[6] + m * 0xf38512bf + c; t[5] = v & M; c = v >> 32;
-    let v = t[7] + m * 0x64774b84 + c; t[6] = v & M; c = v >> 32;
-    let v = t[8] + m * 0x434bacd7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[9] + m * 0x4b1ba7b6 + c; t[8] = v & M; c = v >> 32;
-    let v = t[10] + m * 0x397fe69a + c; t[9] = v & M; c = v >> 32;
-    let v = t[11] + m * 0x1a0111ea + c; t[10] = v & M; c = v >> 32;
-    let s = t[12] + c; t[11] = s & M; t[12] = t[13] + (s >> 32); t[13] = 0;
-    // round 7
-    let mut c = 0u64;
-    let v = t[0] + a7 * b0 + c; t[0] = v & M; c = v >> 32;
-    let v = t[1] + a7 * b1 + c; t[1] = v & M; c = v >> 32;
-    let v = t[2] + a7 * b2 + c; t[2] = v & M; c = v >> 32;
-    let v = t[3] + a7 * b3 + c; t[3] = v & M; c = v >> 32;
-    let v = t[4] + a7 * b4 + c; t[4] = v & M; c = v >> 32;
-    let v = t[5] + a7 * b5 + c; t[5] = v & M; c = v >> 32;
-    let v = t[6] + a7 * b6 + c; t[6] = v & M; c = v >> 32;
-    let v = t[7] + a7 * b7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[8] + a7 * b8 + c; t[8] = v & M; c = v >> 32;
-    let v = t[9] + a7 * b9 + c; t[9] = v & M; c = v >> 32;
-    let v = t[10] + a7 * b10 + c; t[10] = v & M; c = v >> 32;
-    let v = t[11] + a7 * b11 + c; t[11] = v & M; c = v >> 32;
-    let s = t[12] + c; t[12] = s & M; t[13] = s >> 32;
-    let m = (t[0].wrapping_mul(0xfffcfffd)) & M;
-    let v = t[0] + m * 0xffffaaab; let mut c = v >> 32;
-    let v = t[1] + m * 0xb9feffff + c; t[0] = v & M; c = v >> 32;
-    let v = t[2] + m * 0xb153ffff + c; t[1] = v & M; c = v >> 32;
-    let v = t[3] + m * 0x1eabfffe + c; t[2] = v & M; c = v >> 32;
-    let v = t[4] + m * 0xf6b0f624 + c; t[3] = v & M; c = v >> 32;
-    let v = t[5] + m * 0x6730d2a0 + c; t[4] = v & M; c = v >> 32;
-    let v = t[6] + m * 0xf38512bf + c; t[5] = v & M; c = v >> 32;
-    let v = t[7] + m * 0x64774b84 + c; t[6] = v & M; c = v >> 32;
-    let v = t[8] + m * 0x434bacd7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[9] + m * 0x4b1ba7b6 + c; t[8] = v & M; c = v >> 32;
-    let v = t[10] + m * 0x397fe69a + c; t[9] = v & M; c = v >> 32;
-    let v = t[11] + m * 0x1a0111ea + c; t[10] = v & M; c = v >> 32;
-    let s = t[12] + c; t[11] = s & M; t[12] = t[13] + (s >> 32); t[13] = 0;
-    // round 8
-    let mut c = 0u64;
-    let v = t[0] + a8 * b0 + c; t[0] = v & M; c = v >> 32;
-    let v = t[1] + a8 * b1 + c; t[1] = v & M; c = v >> 32;
-    let v = t[2] + a8 * b2 + c; t[2] = v & M; c = v >> 32;
-    let v = t[3] + a8 * b3 + c; t[3] = v & M; c = v >> 32;
-    let v = t[4] + a8 * b4 + c; t[4] = v & M; c = v >> 32;
-    let v = t[5] + a8 * b5 + c; t[5] = v & M; c = v >> 32;
-    let v = t[6] + a8 * b6 + c; t[6] = v & M; c = v >> 32;
-    let v = t[7] + a8 * b7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[8] + a8 * b8 + c; t[8] = v & M; c = v >> 32;
-    let v = t[9] + a8 * b9 + c; t[9] = v & M; c = v >> 32;
-    let v = t[10] + a8 * b10 + c; t[10] = v & M; c = v >> 32;
-    let v = t[11] + a8 * b11 + c; t[11] = v & M; c = v >> 32;
-    let s = t[12] + c; t[12] = s & M; t[13] = s >> 32;
-    let m = (t[0].wrapping_mul(0xfffcfffd)) & M;
-    let v = t[0] + m * 0xffffaaab; let mut c = v >> 32;
-    let v = t[1] + m * 0xb9feffff + c; t[0] = v & M; c = v >> 32;
-    let v = t[2] + m * 0xb153ffff + c; t[1] = v & M; c = v >> 32;
-    let v = t[3] + m * 0x1eabfffe + c; t[2] = v & M; c = v >> 32;
-    let v = t[4] + m * 0xf6b0f624 + c; t[3] = v & M; c = v >> 32;
-    let v = t[5] + m * 0x6730d2a0 + c; t[4] = v & M; c = v >> 32;
-    let v = t[6] + m * 0xf38512bf + c; t[5] = v & M; c = v >> 32;
-    let v = t[7] + m * 0x64774b84 + c; t[6] = v & M; c = v >> 32;
-    let v = t[8] + m * 0x434bacd7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[9] + m * 0x4b1ba7b6 + c; t[8] = v & M; c = v >> 32;
-    let v = t[10] + m * 0x397fe69a + c; t[9] = v & M; c = v >> 32;
-    let v = t[11] + m * 0x1a0111ea + c; t[10] = v & M; c = v >> 32;
-    let s = t[12] + c; t[11] = s & M; t[12] = t[13] + (s >> 32); t[13] = 0;
-    // round 9
-    let mut c = 0u64;
-    let v = t[0] + a9 * b0 + c; t[0] = v & M; c = v >> 32;
-    let v = t[1] + a9 * b1 + c; t[1] = v & M; c = v >> 32;
-    let v = t[2] + a9 * b2 + c; t[2] = v & M; c = v >> 32;
-    let v = t[3] + a9 * b3 + c; t[3] = v & M; c = v >> 32;
-    let v = t[4] + a9 * b4 + c; t[4] = v & M; c = v >> 32;
-    let v = t[5] + a9 * b5 + c; t[5] = v & M; c = v >> 32;
-    let v = t[6] + a9 * b6 + c; t[6] = v & M; c = v >> 32;
-    let v = t[7] + a9 * b7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[8] + a9 * b8 + c; t[8] = v & M; c = v >> 32;
-    let v = t[9] + a9 * b9 + c; t[9] = v & M; c = v >> 32;
-    let v = t[10] + a9 * b10 + c; t[10] = v & M; c = v >> 32;
-    let v = t[11] + a9 * b11 + c; t[11] = v & M; c = v >> 32;
-    let s = t[12] + c; t[12] = s & M; t[13] = s >> 32;
-    let m = (t[0].wrapping_mul(0xfffcfffd)) & M;
-    let v = t[0] + m * 0xffffaaab; let mut c = v >> 32;
-    let v = t[1] + m * 0xb9feffff + c; t[0] = v & M; c = v >> 32;
-    let v = t[2] + m * 0xb153ffff + c; t[1] = v & M; c = v >> 32;
-    let v = t[3] + m * 0x1eabfffe + c; t[2] = v & M; c = v >> 32;
-    let v = t[4] + m * 0xf6b0f624 + c; t[3] = v & M; c = v >> 32;
-    let v = t[5] + m * 0x6730d2a0 + c; t[4] = v & M; c = v >> 32;
-    let v = t[6] + m * 0xf38512bf + c; t[5] = v & M; c = v >> 32;
-    let v = t[7] + m * 0x64774b84 + c; t[6] = v & M; c = v >> 32;
-    let v = t[8] + m * 0x434bacd7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[9] + m * 0x4b1ba7b6 + c; t[8] = v & M; c = v >> 32;
-    let v = t[10] + m * 0x397fe69a + c; t[9] = v & M; c = v >> 32;
-    let v = t[11] + m * 0x1a0111ea + c; t[10] = v & M; c = v >> 32;
-    let s = t[12] + c; t[11] = s & M; t[12] = t[13] + (s >> 32); t[13] = 0;
-    // round 10
-    let mut c = 0u64;
-    let v = t[0] + a10 * b0 + c; t[0] = v & M; c = v >> 32;
-    let v = t[1] + a10 * b1 + c; t[1] = v & M; c = v >> 32;
-    let v = t[2] + a10 * b2 + c; t[2] = v & M; c = v >> 32;
-    let v = t[3] + a10 * b3 + c; t[3] = v & M; c = v >> 32;
-    let v = t[4] + a10 * b4 + c; t[4] = v & M; c = v >> 32;
-    let v = t[5] + a10 * b5 + c; t[5] = v & M; c = v >> 32;
-    let v = t[6] + a10 * b6 + c; t[6] = v & M; c = v >> 32;
-    let v = t[7] + a10 * b7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[8] + a10 * b8 + c; t[8] = v & M; c = v >> 32;
-    let v = t[9] + a10 * b9 + c; t[9] = v & M; c = v >> 32;
-    let v = t[10] + a10 * b10 + c; t[10] = v & M; c = v >> 32;
-    let v = t[11] + a10 * b11 + c; t[11] = v & M; c = v >> 32;
-    let s = t[12] + c; t[12] = s & M; t[13] = s >> 32;
-    let m = (t[0].wrapping_mul(0xfffcfffd)) & M;
-    let v = t[0] + m * 0xffffaaab; let mut c = v >> 32;
-    let v = t[1] + m * 0xb9feffff + c; t[0] = v & M; c = v >> 32;
-    let v = t[2] + m * 0xb153ffff + c; t[1] = v & M; c = v >> 32;
-    let v = t[3] + m * 0x1eabfffe + c; t[2] = v & M; c = v >> 32;
-    let v = t[4] + m * 0xf6b0f624 + c; t[3] = v & M; c = v >> 32;
-    let v = t[5] + m * 0x6730d2a0 + c; t[4] = v & M; c = v >> 32;
-    let v = t[6] + m * 0xf38512bf + c; t[5] = v & M; c = v >> 32;
-    let v = t[7] + m * 0x64774b84 + c; t[6] = v & M; c = v >> 32;
-    let v = t[8] + m * 0x434bacd7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[9] + m * 0x4b1ba7b6 + c; t[8] = v & M; c = v >> 32;
-    let v = t[10] + m * 0x397fe69a + c; t[9] = v & M; c = v >> 32;
-    let v = t[11] + m * 0x1a0111ea + c; t[10] = v & M; c = v >> 32;
-    let s = t[12] + c; t[11] = s & M; t[12] = t[13] + (s >> 32); t[13] = 0;
-    // round 11
-    let mut c = 0u64;
-    let v = t[0] + a11 * b0 + c; t[0] = v & M; c = v >> 32;
-    let v = t[1] + a11 * b1 + c; t[1] = v & M; c = v >> 32;
-    let v = t[2] + a11 * b2 + c; t[2] = v & M; c = v >> 32;
-    let v = t[3] + a11 * b3 + c; t[3] = v & M; c = v >> 32;
-    let v = t[4] + a11 * b4 + c; t[4] = v & M; c = v >> 32;
-    let v = t[5] + a11 * b5 + c; t[5] = v & M; c = v >> 32;
-    let v = t[6] + a11 * b6 + c; t[6] = v & M; c = v >> 32;
-    let v = t[7] + a11 * b7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[8] + a11 * b8 + c; t[8] = v & M; c = v >> 32;
-    let v = t[9] + a11 * b9 + c; t[9] = v & M; c = v >> 32;
-    let v = t[10] + a11 * b10 + c; t[10] = v & M; c = v >> 32;
-    let v = t[11] + a11 * b11 + c; t[11] = v & M; c = v >> 32;
-    let s = t[12] + c; t[12] = s & M; t[13] = s >> 32;
-    let m = (t[0].wrapping_mul(0xfffcfffd)) & M;
-    let v = t[0] + m * 0xffffaaab; let mut c = v >> 32;
-    let v = t[1] + m * 0xb9feffff + c; t[0] = v & M; c = v >> 32;
-    let v = t[2] + m * 0xb153ffff + c; t[1] = v & M; c = v >> 32;
-    let v = t[3] + m * 0x1eabfffe + c; t[2] = v & M; c = v >> 32;
-    let v = t[4] + m * 0xf6b0f624 + c; t[3] = v & M; c = v >> 32;
-    let v = t[5] + m * 0x6730d2a0 + c; t[4] = v & M; c = v >> 32;
-    let v = t[6] + m * 0xf38512bf + c; t[5] = v & M; c = v >> 32;
-    let v = t[7] + m * 0x64774b84 + c; t[6] = v & M; c = v >> 32;
-    let v = t[8] + m * 0x434bacd7 + c; t[7] = v & M; c = v >> 32;
-    let v = t[9] + m * 0x4b1ba7b6 + c; t[8] = v & M; c = v >> 32;
-    let v = t[10] + m * 0x397fe69a + c; t[9] = v & M; c = v >> 32;
-    let v = t[11] + m * 0x1a0111ea + c; t[10] = v & M; c = v >> 32;
-    let s = t[12] + c; t[11] = s & M; t[12] = t[13] + (s >> 32); t[13] = 0;
-    let mut r = [0u64; 6];
-    r[0] = t[0] | (t[1] << 32);
-    r[1] = t[2] | (t[3] << 32);
-    r[2] = t[4] | (t[5] << 32);
-    r[3] = t[6] | (t[7] << 32);
-    r[4] = t[8] | (t[9] << 32);
-    r[5] = t[10] | (t[11] << 32);
-    if t[12] != 0 || geq(&r, &MODULUS) {
-        r = sub_nocheck(&r, &MODULUS);
-    }
-    r
-}
-
-/// Product-scanning Montgomery multiply with 30-bit limbs and lazy
-/// carries.
-///
-/// NOTE: reduces by 2^390, not 2^384.
-const MASK30: u64 = (1 << 30) - 1;
-
-fn to_limbs30(a: &Fp) -> [u64; 13] {
-    let mut out = [0u64; 13];
-    let mut bit = 0usize;
-    for slot in out.iter_mut() {
-        let word = bit / 64;
-        let off = bit % 64;
-        let mut v = a[word] >> off;
-        if off > 34 && word + 1 < 6 {
-            v |= a[word + 1] << (64 - off);
-        }
-        *slot = v & MASK30;
-        bit += 30;
-    }
-    out
-}
-
-fn from_limbs30(a: &[u64; 13]) -> Fp {
-    let mut out = [0u64; 6];
-    for (i, &limb) in a.iter().enumerate() {
-        let bit = i * 30;
-        let word = bit / 64;
-        let off = bit % 64;
-        out[word] |= limb << off;
-        if off > 34 && word + 1 < 6 {
-            out[word + 1] |= limb >> (64 - off);
-        }
-    }
-    out
-}
-
-fn mont_mul_comba30(a: &Fp, b: &Fp) -> Fp {
-    let a30 = to_limbs30(a);
-    let b30 = to_limbs30(b);
-    let p30 = to_limbs30(&MODULUS);
-
-    // full product, column scan: <= 13 products of < 2^60 per column
-    // plus a < 2^35 running carry fits u64
-    let mut t = [0u64; 26];
-    let mut acc = 0u64;
-    for col in 0usize..25 {
-        let lo = col.saturating_sub(12);
-        let hi = if col < 13 { col } else { 12 };
-        for i in lo..=hi {
-            acc += a30[i] * b30[col - i];
-        }
-        t[col] = acc & MASK30;
-        acc >>= 30;
-    }
-    t[25] = acc;
-
-    // reduction scan: fold 13 rounds of m*p column-wise
-    let mut m = [0u64; 13];
-    let mut acc = 0u64;
-    for col in 0..13 {
-        acc += t[col];
-        for i in 0..col {
-            acc += m[i] * p30[col - i];
-        }
-        m[col] = (acc & MASK30).wrapping_mul(INV30) & MASK30;
-        acc += m[col] * p30[0];
-        debug_assert_eq!(acc & MASK30, 0);
-        acc >>= 30;
-    }
-    for col in 13..26 {
-        if col < 26 {
-            acc += t[col];
-        }
-        for i in (col - 12)..13 {
-            acc += m[i] * p30[col - i];
-        }
-        t[col - 13] = acc & MASK30;
-        acc >>= 30;
-    }
-    let mut r = from_limbs30(&t[..13].try_into().unwrap());
-    if acc != 0 || geq(&r, &MODULUS) {
-        r = sub_nocheck(&r, &MODULUS);
-    }
-    r
-}
-
-/// -p^-1 mod 2^30 for the 30-bit-limb reduction.
-const INV30: u64 = INV & MASK30;
-
-/// p^2 in 32-bit lanes, the offset that keeps lazy Fp2 differences
-/// non-negative.
-pub(crate) const P2_WIDE: [u64; 24] = [
-    0x1c718e39,
-    0x26aa0000,
-    0x76382eab,
-    0x7ced6b1d,
-    0x62113cfd,
-    0x162c3383,
-    0x3e71b743,
-    0x66bf91ed,
-    0x7091a049,
-    0x292e85a8,
-    0x86185c7b,
-    0x1d68619c,
-    0x0978ef01,
-    0xf5314933,
-    0x16ddca6e,
-    0x50a62cfd,
-    0x349e8bd0,
-    0x66e59e49,
-    0x0e7046b4,
-    0xe2dc90e5,
-    0xa22f25e9,
-    0x4bd278ea,
-    0xb8c35fc7,
-    0x02a437a4,
-];
-
-pub(crate) const TWO_P2_WIDE: [u64; 24] = [
-    0x38e31c72,
-    0x4d540000,
-    0xec705d56,
-    0xf9dad63a,
-    0xc42279fa,
-    0x2c586706,
-    0x7ce36e86,
-    0xcd7f23da,
-    0xe1234092,
-    0x525d0b50,
-    0x0c30b8f6,
-    0x3ad0c339,
-    0x12f1de02,
-    0xea629266,
-    0x2dbb94dd,
-    0xa14c59fa,
-    0x693d17a0,
-    0xcdcb3c92,
-    0x1ce08d68,
-    0xc5b921ca,
-    0x445e4bd3,
-    0x97a4f1d5,
-    0x7186bf8e,
-    0x05486f49,
-];
-
-/// Full 768-bit product in 32-bit lanes, no reduction.
-pub(crate) fn mul_wide32(a: &Fp, b: &Fp) -> [u64; 24] {
-    let mut a32 = [0u64; 12];
-    let mut b32 = [0u64; 12];
-    for i in 0..6 {
-        a32[i * 2] = a[i] & 0xffff_ffff;
-        a32[i * 2 + 1] = a[i] >> 32;
-        b32[i * 2] = b[i] & 0xffff_ffff;
-        b32[i * 2 + 1] = b[i] >> 32;
-    }
-    let mut t = [0u64; 24];
-    for i in 0..12 {
-        let mut carry = 0u64;
-        for j in 0..12 {
-            let (lo, hi) = mac32(t[i + j], a32[i], b32[j], carry);
-            t[i + j] = lo;
-            carry = hi;
-        }
-        t[i + 12] = carry;
-    }
-    t
-}
-
-/// Montgomery reduction of a 768-bit lane vector; input below p * 2^384.
-pub(crate) fn reduce_wide32(t: &mut [u64; 24]) -> Fp {
-    let mut p32 = [0u64; 12];
-    for i in 0..6 {
-        p32[i * 2] = MODULUS[i] & 0xffff_ffff;
-        p32[i * 2 + 1] = MODULUS[i] >> 32;
-    }
-    let mut carry2 = 0u64;
-    for i in 0..12 {
-        let m = t[i].wrapping_mul(INV32) & 0xffff_ffff;
-        let mut carry = 0u64;
-        for j in 0..12 {
-            let (lo, hi) = mac32(t[i + j], m, p32[j], carry);
-            t[i + j] = lo;
-            carry = hi;
-        }
-        let v = t[i + 12] + carry2 + carry;
-        t[i + 12] = v & 0xffff_ffff;
-        carry2 = v >> 32;
-    }
-    let mut r = [0u64; 6];
-    for i in 0..6 {
-        r[i] = t[12 + i * 2] | (t[12 + i * 2 + 1] << 32);
-    }
-    if carry2 != 0 || geq(&r, &MODULUS) {
-        r = sub_nocheck(&r, &MODULUS);
-    }
-    r
-}
-
-pub(crate) fn wide_add(a: &[u64; 24], b: &[u64; 24]) -> [u64; 24] {
-    let mut r = [0u64; 24];
-    let mut c = 0u64;
-    for i in 0..24 {
-        let v = a[i] + b[i] + c;
-        r[i] = v & 0xffff_ffff;
-        c = v >> 32;
-    }
-    r
-}
-
-/// a - b for a >= b, lanes normalized.
-pub(crate) fn wide_sub(a: &[u64; 24], b: &[u64; 24]) -> [u64; 24] {
-    let mut r = [0u64; 24];
-    let mut borrow = 0u64;
-    for i in 0..24 {
-        let v = a[i].wrapping_sub(b[i] + borrow);
-        r[i] = v & 0xffff_ffff;
-        borrow = (v >> 63) & 1;
-    }
-    r
-}
-
 /// CIOS variant: single interleaved pass, less memory traffic than SOS.
 fn mont_mul_cios64(a: &Fp, b: &Fp) -> Fp {
     let mut t = [0u64; 8];
@@ -1301,6 +618,21 @@ fn mont_mul_cios64(a: &Fp, b: &Fp) -> Fp {
 
 const INV32: u64 = INV & 0xffff_ffff;
 
+const fn split32(x: &Fp) -> [u64; 12] {
+    let mut out = [0u64; 12];
+    let mut i = 0;
+    while i < 6 {
+        out[i * 2] = x[i] & 0xffff_ffff;
+        out[i * 2 + 1] = x[i] >> 32;
+        i += 1;
+    }
+    out
+}
+
+// The modulus never changes, so its 32-bit lanes belong in a constant rather
+// than being rebuilt on every multiply.
+const P32: [u64; 12] = split32(&MODULUS);
+
 #[inline(always)]
 fn mac32(acc: u64, a: u64, b: u64, carry: u64) -> (u64, u64) {
     let t = acc + a * b + carry;
@@ -1309,17 +641,8 @@ fn mac32(acc: u64, a: u64, b: u64, carry: u64) -> (u64, u64) {
 
 /// CIOS with 32-bit limbs: the multiply-accumulate needs no wide arithmetic.
 fn mont_mul_cios32(a: &Fp, b: &Fp) -> Fp {
-    let mut a32 = [0u64; 12];
-    let mut b32 = [0u64; 12];
-    let mut p32 = [0u64; 12];
-    for i in 0..6 {
-        a32[i * 2] = a[i] & 0xffff_ffff;
-        a32[i * 2 + 1] = a[i] >> 32;
-        b32[i * 2] = b[i] & 0xffff_ffff;
-        b32[i * 2 + 1] = b[i] >> 32;
-        p32[i * 2] = MODULUS[i] & 0xffff_ffff;
-        p32[i * 2 + 1] = MODULUS[i] >> 32;
-    }
+    let a32 = split32(a);
+    let b32 = split32(b);
 
     let mut t = [0u64; 14];
     for i in 0..12 {
@@ -1335,9 +658,9 @@ fn mont_mul_cios32(a: &Fp, b: &Fp) -> Fp {
         t[13] = s >> 32;
 
         let m = (t[0].wrapping_mul(INV32)) & 0xffff_ffff;
-        let (_, mut carry) = mac32(t[0], m, p32[0], 0);
+        let (_, mut carry) = mac32(t[0], m, P32[0], 0);
         for j in 1..12 {
-            let (lo, hi) = mac32(t[j], m, p32[j], carry);
+            let (lo, hi) = mac32(t[j], m, P32[j], carry);
             t[j - 1] = lo;
             carry = hi;
         }
@@ -1361,11 +684,7 @@ pub fn mul_bench(variant: u8, count: u64) -> u64 {
     let mul: fn(&Fp, &Fp) -> Fp = match variant {
         0 => mont_mul,
         1 => mont_mul_cios64,
-        2 => mont_mul_cios32,
-        3 => |a: &Fp, _: &Fp| mont_sqr_sos32(a),
-        4 => |a: &Fp, _: &Fp| mont_mul(a, a),
-        5 => mont_mul_comba30,
-        _ => mont_mul_cios32_unrolled,
+        _ => mont_mul_cios32,
     };
     let mut acc = R2;
     let x = to_mont(&[3, 0, 0, 0, 0, 0]);
@@ -1484,13 +803,16 @@ fn map_to_curve_witnessed(u: &FieldElem, wit: &[u8]) -> Result<PointPrime, Progr
     if mont_sqr(&yw_m) != gx {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let mut y_canonical = y_w;
 
-    if (y_canonical[0] & 1) != (u.canonical[0] & 1) {
-        y_canonical = neg_mod(&y_canonical);
-    }
+    // Negation commutes with the Montgomery map, so flip the square root we
+    // already converted rather than converting the canonical value a second time.
+    let y = if (y_w[0] & 1) != (u.canonical[0] & 1) {
+        neg_mod(&yw_m)
+    } else {
+        yw_m
+    };
 
-    Ok(PointPrime { x, y: to_mont(&y_canonical) })
+    Ok(PointPrime { x, y })
 }
 
 fn add_prime_witnessed(
@@ -1598,8 +920,6 @@ pub fn run_witnessed(payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
 pub mod witness {
     use super::*;
 
-    /// comba30 reduces by 2^390 where mont_mul reduces by 2^384, so
-    /// comba30(a,b) * 2^6 must equal mont_mul(a,b) exactly.
     /// The adapted chains must agree with Horner over the original
     /// coefficient tables at arbitrary points.
     pub fn iso11_adapted_selftest() {
@@ -1613,20 +933,6 @@ pub mod witness {
             );
             assert_eq!(iso11_adapted(&x), expect, "adapted iso11 diverged");
             x = add_mod(&mont_mul(&x, &R2), &[i, 1, 0, 0, 0, 0]);
-        }
-    }
-
-    pub fn comba30_selftest() {
-        let mut x: Fp = [1, 2, 3, 4, 5, 0];
-        let mut y = R2;
-        for _ in 0..100 {
-            let mut lifted = mont_mul_comba30(&x, &y);
-            for _ in 0..6 {
-                lifted = add_mod(&lifted, &lifted);
-            }
-            assert_eq!(lifted, mont_mul(&x, &y), "comba30 disagrees with mont_mul");
-            x = mont_mul(&x, &R2);
-            y = add_mod(&mont_mul(&y, &y), &x);
         }
     }
 

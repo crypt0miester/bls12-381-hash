@@ -342,15 +342,7 @@ fn bench_mont_mul() {
 fn bench_mul_variants() {
     let mollusk = mollusk();
     let mut results = vec![];
-    for (variant, name) in [
-        (0u8, "sos64"),
-        (1, "cios64"),
-        (2, "cios32"),
-        (3, "sqr32"),
-        (4, "mul-self"),
-        (5, "comba30"),
-        (6, "cios32-unrolled"),
-    ] {
+    for (variant, name) in [(0u8, "sos64"), (1, "cios64"), (2, "cios32")] {
         let mut base_data = vec![variant];
         base_data.extend_from_slice(&0u64.to_le_bytes());
         let mut loop_data = vec![variant];
@@ -365,9 +357,6 @@ fn bench_mul_variants() {
     }
     assert_eq!(results[0], results[1], "cios64 disagrees with sos64");
     assert_eq!(results[0], results[2], "cios32 disagrees with sos64");
-    assert_eq!(results[3], results[4], "sqr32 disagrees with mul-self");
-    assert_eq!(results[0], results[6], "cios32-unrolled disagrees with sos64");
-    bls381_bench::g1_msig::witness::comba30_selftest();
     bls381_bench::g1_msig::witness::iso11_adapted_selftest();
 }
 
