@@ -26,6 +26,7 @@ const BLS_X_ABS: u64 = 0xd201000000010000;
 
 const BLS12_381_G2_BE: u64 = 6 | 0x80;
 const OP_ADD: u64 = 0;
+const OP_SUB: u64 = 1;
 const POINT: usize = 192;
 
 // blob: flag0, y0, flag1, y1, w_tv2_pair, w_dx, w_den_pair
@@ -62,6 +63,7 @@ pub(crate) fn is_zero2(a: &Fp2) -> bool {
 
 /// Karatsuba: works whenever the component products are valid mont_mul calls,
 /// so also for canonical-times-Montgomery mixed-domain multiplication.
+#[inline(always)]
 pub(crate) fn mul2(a: &Fp2, b: &Fp2) -> Fp2 {
     let t0 = mont_mul(&a.c0, &b.c0);
     let t1 = mont_mul(&a.c1, &b.c1);
@@ -75,6 +77,7 @@ pub(crate) fn mul2(a: &Fp2, b: &Fp2) -> Fp2 {
 }
 
 
+#[inline(always)]
 pub(crate) fn sq2(a: &Fp2) -> Fp2 {
     let s = add_mod(&a.c0, &a.c1);
     let d = sub_mod(&a.c0, &a.c1);
@@ -358,21 +361,25 @@ fn parse_point(bytes: &[u8; POINT]) -> (Fp2, Fp2) {
     (x, y)
 }
 
-fn g2_add(a: &[u8; POINT], b: &[u8; POINT]) -> Result<[u8; POINT], ProgramError> {
+fn g2_group_op(op: u64, a: &[u8; POINT], b: &[u8; POINT]) -> Result<[u8; POINT], ProgramError> {
     let mut out = [0u8; POINT];
     let rc = unsafe {
-        sys::sol_curve_group_op(
-            BLS12_381_G2_BE,
-            OP_ADD,
-            a.as_ptr(),
-            b.as_ptr(),
-            out.as_mut_ptr(),
-        )
+        sys::sol_curve_group_op(BLS12_381_G2_BE, op, a.as_ptr(), b.as_ptr(), out.as_mut_ptr())
     };
     if rc != 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
     Ok(out)
+}
+
+fn g2_add(a: &[u8; POINT], b: &[u8; POINT]) -> Result<[u8; POINT], ProgramError> {
+    g2_group_op(OP_ADD, a, b)
+}
+
+// The sub syscall skips the subgroup check like add, so it is safe on the
+// pre-cleared cofactor intermediates and saves an in-program negation each call.
+fn g2_sub(a: &[u8; POINT], b: &[u8; POINT]) -> Result<[u8; POINT], ProgramError> {
+    g2_group_op(OP_SUB, a, b)
 }
 
 pub(crate) fn g2_validate(p: &[u8; POINT]) -> Result<(), ProgramError> {
@@ -434,9 +441,9 @@ pub(crate) fn clear_cofactor(p: &[u8; POINT]) -> Result<[u8; POINT], ProgramErro
     let s2 = mul_by_x(&g2_add(&t1, &t2)?)?;
 
     let mut r = g2_add(&p2, &s2)?;
-    r = g2_add(&r, &neg_point(&t1))?;
-    r = g2_add(&r, &neg_point(&t2))?;
-    r = g2_add(&r, &neg_point(p))?;
+    r = g2_sub(&r, &t1)?;
+    r = g2_sub(&r, &t2)?;
+    r = g2_sub(&r, p)?;
     Ok(r)
 }
 

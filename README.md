@@ -12,12 +12,12 @@ Measured with mollusk 0.13.4 on the agave 4.0 stack, SBF v3.
 
 | pipeline | CU | witness | compatibility |
 |---|---|---|---|
-| hash_to_G1 (RO, min-sig) | ~234k | 338 B | `_SSWU_RO_POP_`, byte-equal to blst |
-| hash_to_G2 (RO, min-pk) | ~463k | 482 B | `_SSWU_RO_POP_`, byte-equal to blst |
-| encode_to_G1 (NU) | ~177k | 193 B | `_SSWU_NU_POP_`, byte-equal to blst encode |
-| encode_to_G2 (NU) | ~315k | 289 B | `_SSWU_NU_POP_`, byte-equal to blst encode |
+| hash_to_G1 (RO, min-sig) | ~233k | 338 B | `_SSWU_RO_POP_`, byte-equal to blst |
+| hash_to_G2 (RO, min-pk) | ~459k | 482 B | `_SSWU_RO_POP_`, byte-equal to blst |
+| encode_to_G1 (NU) | ~176k | 193 B | `_SSWU_NU_POP_`, byte-equal to blst encode |
+| encode_to_G2 (NU) | ~312k | 289 B | `_SSWU_NU_POP_`, byte-equal to blst encode |
 | hash_to_G1 (SvdW) | ~159k | 242 to 434 B | custom suite |
-| hash_to_G2 (SvdW) | ~420k | 482 to 866 B | custom suite |
+| hash_to_G2 (SvdW) | ~418k | 482 to 866 B | custom suite |
 
 For scale, a naive port of zkcrypto `bls12_381` costs 11.3M CU for G1 and
 46.5M CU for G2, and a single 381-bit field multiplication bottoms out around
@@ -74,11 +74,11 @@ a finding.
 
 Open knobs, in rough order of interest:
 
-- The modexp path (tags 30 to 33) runs hash_to_G1 in ~291k CU with zero
-  witness bytes, against ~234k plus 338 B for the witnessed path. It needs
+- The modexp path (tags 30 to 33) runs hash_to_G1 in ~289k CU with zero
+  witness bytes, against ~233k plus 338 B for the witnessed path. It needs
   `big_mod_exp` (SIMD-0529, merged but not active). Once 0529 activates, a
   transaction that is byte-bound rather than CU-bound should prefer it.
-- The min-pk verify transaction is closer to byte-bound than CU-bound (517k
+- The min-pk verify transaction is closer to byte-bound than CU-bound (513k
   of the 1.4M CU ceiling, but witness plus keys eat real transaction space).
   Batching all five G2 inverses behind one witness would save 192 B for
   roughly 17k CU. Not implemented; the right trade depends on the consumer.

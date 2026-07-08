@@ -83,6 +83,7 @@ pub(crate) fn sub_nocheck(a: &Fp, b: &Fp) -> Fp {
     r
 }
 
+#[inline(always)]
 pub(crate) fn add_mod(a: &Fp, b: &Fp) -> Fp {
     let mut r = [0u64; 6];
     let mut carry = 0u64;
@@ -97,6 +98,7 @@ pub(crate) fn add_mod(a: &Fp, b: &Fp) -> Fp {
     r
 }
 
+#[inline(always)]
 pub(crate) fn sub_mod(a: &Fp, b: &Fp) -> Fp {
     if geq(a, b) {
         sub_nocheck(a, b)
@@ -640,6 +642,7 @@ fn mac32(acc: u64, a: u64, b: u64, carry: u64) -> (u64, u64) {
 }
 
 /// CIOS with 32-bit limbs: the multiply-accumulate needs no wide arithmetic.
+#[inline(always)]
 fn mont_mul_cios32(a: &Fp, b: &Fp) -> Fp {
     let a32 = split32(a);
     let b32 = split32(b);
