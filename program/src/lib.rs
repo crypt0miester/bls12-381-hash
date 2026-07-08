@@ -2,8 +2,10 @@
 
 mod g1_consts;
 pub mod g1_msig;
+pub mod g1_svdw;
 mod g2_consts;
 pub mod g2_msig;
+pub mod g2_svdw;
 
 use core::hint::black_box;
 
@@ -349,6 +351,25 @@ fn process_instruction(
         }
         41 => {
             let out = g2_msig::run_witnessed(payload)?;
+            set_return_data(&out);
+        }
+        // Witnessed SvdW direct-map hash_to_G1: no isogeny, custom suite.
+        42 => {
+            let out = g1_svdw::run_witnessed(payload)?;
+            set_return_data(&out);
+        }
+        // Witnessed encode_to_curve (RFC 9380 NU suites): single map.
+        44 => {
+            let out = g1_msig::run_witnessed_nu(payload)?;
+            set_return_data(&out);
+        }
+        45 => {
+            let out = g2_msig::run_witnessed_nu(payload)?;
+            set_return_data(&out);
+        }
+        // Witnessed SvdW direct-map hash_to_G2: no isogeny, custom suite.
+        43 => {
+            let out = g2_svdw::run_witnessed(payload)?;
             set_return_data(&out);
         }
         35 => {

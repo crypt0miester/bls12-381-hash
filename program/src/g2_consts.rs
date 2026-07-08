@@ -125,3 +125,320 @@ pub const C256_MONT: [u64; 6] = [
     0x0f9628b49caa2e85,
 ];
 
+
+// Shallue-van de Woestijne direct-map constants for E2 (Wahby-Boneh
+// eprint 2019/403 section 3, u0 = -1), Montgomery form, derived offline.
+pub const SVDW2_F_U0: [[u64; 6]; 2] = [
+    [
+        0xee1d00000009aaa1,
+        0x86840025e97c0007,
+        0x4f7823c40df41de8,
+        0x9e7c71f069ece051,
+        0x7dde005a606d6b99,
+        0x0de0f8777c82e085,
+    ],
+    [
+        0xaa270000000cfff3,
+        0x53cc0032fc34000a,
+        0x478fe97a6b0a807f,
+        0xb1d37ebee6ba24d7,
+        0x8ec9733bbf78ab2f,
+        0x09d645513d83de7e,
+    ],
+];
+
+pub const SVDW2_B: [[u64; 6]; 2] = [
+    [
+        0xaa270000000cfff3,
+        0x53cc0032fc34000a,
+        0x478fe97a6b0a807f,
+        0xb1d37ebee6ba24d7,
+        0x8ec9733bbf78ab2f,
+        0x09d645513d83de7e,
+    ],
+    [
+        0xaa270000000cfff3,
+        0x53cc0032fc34000a,
+        0x478fe97a6b0a807f,
+        0xb1d37ebee6ba24d7,
+        0x8ec9733bbf78ab2f,
+        0x09d645513d83de7e,
+    ],
+];
+
+pub const SVDW2_SQRT_M3: [u64; 6] = [
+    0x1dec6c36f3181f22,
+    0xb4b9bb641054b457,
+    0x25695a2be9415286,
+    0x982b6cbf66c749bc,
+    0x7d58e1ae1feb7873,
+    0x062c96300937c0b9,
+];
+
+pub const SVDW2_C1: [u64; 6] = [
+    0xecfb361b798dba3a,
+    0xc100ddb891865a2c,
+    0x0ec08ff1232bda8e,
+    0xd5c13cc6f1ca4721,
+    0x47222a47bf7b5c04,
+    0x0110f184e51c5f59,
+];
+
+pub const SVDW2_INV_3U0SQ: [u64; 6] = [
+    0x4e02555555561c71,
+    0x0dc400030ce6aaab,
+    0xb9e369ddc0631701,
+    0xc03efa7472742996,
+    0xa614ce0162fa175e,
+    0x18a82b8824803b42,
+];
+
+// Adapted iso-3 evaluation constants: each cubic is the identity
+// (y + g)(y^2 + q1) + q0 (plus the leading coefficient when not
+// monic); derived and checked offline.
+
+pub const ISO3A_XNUM: [[[u64; 6]; 2]; 4] = [
+    [
+        [
+            0x447600000027552e,
+            0xdcb8009a43480020,
+            0x6f7ee9ce4a6e8b59,
+            0xb10330b7c0a95bc6,
+            0x6140b1fcfb1e54b7,
+            0x0381be097f0bb4e1,
+        ],
+        [
+            0x7588ffffffd8557d,
+            0x41f3ff646e0bffdf,
+            0xf7b1e8d2ac426aca,
+            0xb3741acd32dbb6f8,
+            0xe9daf5b9482d581f,
+            0x167f53e0ba7431b8,
+        ],
+    ],
+    [
+        [
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+        ],
+        [
+            0x3112ffffffb1004f,
+            0x653bfeca2ac3ffbf,
+            0x8832ff0461d3df70,
+            0x0270ea1572325b32,
+            0x889a43bc4d0f0368,
+            0x12fd95d73b687cd7,
+        ],
+    ],
+    [
+        [
+            0x68c3000007964dbf,
+            0xdafc1dc1b5040639,
+            0x33b5ba30e20d67d9,
+            0x38a40ccd12064556,
+            0x698596623c80d54c,
+            0x19a539a535c21604,
+        ],
+        [
+            0x68c3000007964dbf,
+            0xdafc1dc1b5040639,
+            0x33b5ba30e20d67d9,
+            0x38a40ccd12064556,
+            0x698596623c80d54c,
+            0x19a539a535c21604,
+        ],
+    ],
+    [
+        [
+            0x40aac71c71c725ed,
+            0x190955557a84e38e,
+            0xd817050a8f41abc3,
+            0xd86485d4c87f6fb1,
+            0x696eb479f885d059,
+            0x198e1a74328002d2,
+        ],
+        [
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+        ],
+    ],
+];
+
+pub const ISO3A_YNUM: [[[u64; 6]; 2]; 4] = [
+    [
+        [
+            0x66b10000003affc5,
+            0xcb1400e764ec0030,
+            0xa73e5eb56fa5d106,
+            0x8984c913a0fe09a9,
+            0x11e10afb78ad7f13,
+            0x05429d0e3e918f52,
+        ],
+        [
+            0x534dffffffc4aae6,
+            0x5397ff174c67ffcf,
+            0xbff273eb870b251d,
+            0xdaf2827152870915,
+            0x393a9cbaca9e2dc3,
+            0x14be74dbfaee5748,
+        ],
+    ],
+    [
+        [
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+        ],
+        [
+            0x4bd8fffffc9dae0d,
+            0x6433f2ba4bcbfd39,
+            0xa0aa60287e92e8b3,
+            0xf71fb2c44c015530,
+            0x85c3ab653547bebc,
+            0x00dce0edc17e2870,
+        ],
+    ],
+    [
+        [
+            0x05d200003345ccba,
+            0x0ae8c91755182a10,
+            0x2c110485dfba800a,
+            0x4a019765b4a23a51,
+            0xdc147e44919f7c44,
+            0x076a517f64429e8a,
+        ],
+        [
+            0x05d200003345ccba,
+            0x0ae8c91755182a10,
+            0x2c110485dfba800a,
+            0x4a019765b4a23a51,
+            0xdc147e44919f7c44,
+            0x076a517f64429e8a,
+        ],
+    ],
+    [
+        [
+            0xa470bda12f67f35c,
+            0xc0fe38e23327b425,
+            0xc9d3d0f2c6f0678d,
+            0x1c55c9935b5a982e,
+            0x27f6c0e2f0746764,
+            0x117c5e6e28aa9054,
+        ],
+        [
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+        ],
+    ],
+];
+
+pub const ISO3A_YDEN: [[[u64; 6]; 2]; 3] = [
+    [
+        [
+            0x66b10000003affc5,
+            0xcb1400e764ec0030,
+            0xa73e5eb56fa5d106,
+            0x8984c913a0fe09a9,
+            0x11e10afb78ad7f13,
+            0x05429d0e3e918f52,
+        ],
+        [
+            0x534dffffffc4aae6,
+            0x5397ff174c67ffcf,
+            0xbff273eb870b251d,
+            0xdaf2827152870915,
+            0x393a9cbaca9e2dc3,
+            0x14be74dbfaee5748,
+        ],
+    ],
+    [
+        [
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+        ],
+        [
+            0x5db0fffffd3b02c5,
+            0xd713f52358ebfdba,
+            0x5ea60761a84d161a,
+            0xbb2c75a34ea6c44a,
+            0x0ac6735921c1119b,
+            0x0ee3d913bdacfbf6,
+        ],
+    ],
+    [
+        [
+            0x68e600002c4c7e5e,
+            0xc178adbd5e882457,
+            0x1d87c42f1e183bbb,
+            0x39e198fc98c676d4,
+            0x42ad578c84e3a6ae,
+            0x15cd21ea642f42a6,
+        ],
+        [
+            0x68e600002c4c7e5e,
+            0xc178adbd5e882457,
+            0x1d87c42f1e183bbb,
+            0x39e198fc98c676d4,
+            0x42ad578c84e3a6ae,
+            0x15cd21ea642f42a6,
+        ],
+    ],
+];
+
+pub const ISO3A_XDEN: [[[u64; 6]; 2]; 2] = [
+    [
+        [
+            0x447600000027552e,
+            0xdcb8009a43480020,
+            0x6f7ee9ce4a6e8b59,
+            0xb10330b7c0a95bc6,
+            0x6140b1fcfb1e54b7,
+            0x0381be097f0bb4e1,
+        ],
+        [
+            0x7588ffffffd8557d,
+            0x41f3ff646e0bffdf,
+            0xf7b1e8d2ac426aca,
+            0xb3741acd32dbb6f8,
+            0xe9daf5b9482d581f,
+            0x167f53e0ba7431b8,
+        ],
+    ],
+    [
+        [
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+        ],
+        [
+            0x1f3affffff13ab97,
+            0xf25bfc611da3ff3e,
+            0xca3757cb3819b208,
+            0x3e6427366f8cec18,
+            0x03977bc86095b089,
+            0x04f69db13f39a952,
+        ],
+    ],
+];

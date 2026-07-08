@@ -342,7 +342,15 @@ fn bench_mont_mul() {
 fn bench_mul_variants() {
     let mollusk = mollusk();
     let mut results = vec![];
-    for (variant, name) in [(0u8, "sos64"), (1, "cios64"), (2, "cios32")] {
+    for (variant, name) in [
+        (0u8, "sos64"),
+        (1, "cios64"),
+        (2, "cios32"),
+        (3, "sqr32"),
+        (4, "mul-self"),
+        (5, "comba30"),
+        (6, "cios32-unrolled"),
+    ] {
         let mut base_data = vec![variant];
         base_data.extend_from_slice(&0u64.to_le_bytes());
         let mut loop_data = vec![variant];
@@ -357,6 +365,10 @@ fn bench_mul_variants() {
     }
     assert_eq!(results[0], results[1], "cios64 disagrees with sos64");
     assert_eq!(results[0], results[2], "cios32 disagrees with sos64");
+    assert_eq!(results[3], results[4], "sqr32 disagrees with mul-self");
+    assert_eq!(results[0], results[6], "cios32-unrolled disagrees with sos64");
+    bls381_bench::g1_msig::witness::comba30_selftest();
+    bls381_bench::g1_msig::witness::iso11_adapted_selftest();
 }
 
 #[test]
@@ -404,6 +416,70 @@ fn bench_witness_hash_to_g1() {
 }
 
 #[test]
+fn bench_witness_svdw_hash_to_g1() {
+    let mollusk = mollusk();
+
+    let witnesses = bls381_bench::g1_svdw::witness::generate(MESSAGE);
+    let mut payload = witnesses.clone();
+    payload.extend_from_slice(MESSAGE);
+
+    let result = run(&mollusk, 42, &payload);
+    assert!(
+        !result.program_result.is_err(),
+        "witnessed svdw hash_to_g1 failed: {:?}",
+        result.program_result
+    );
+
+    // Reference: host-side pre-clearing sum, effective cofactor applied
+    // through zkcrypto scalar multiplication.
+    let pre = bls381_bench::g1_svdw::witness::reference_preclear(MESSAGE);
+    let aff = Option::<G1Affine>::from(G1Affine::from_uncompressed_unchecked(&pre))
+        .expect("reference point parses");
+    let expected = G1Affine::from(G1Projective::from(aff) * Scalar::from(0xd201000000010001u64))
+        .to_uncompressed();
+    assert_eq!(result.return_data, expected.to_vec(), "differs from host reference");
+
+    // Different map, different suite: must NOT match the SSWU hash.
+    let mut point = blst::blst_p1::default();
+    let mut sswu = [0u8; 96];
+    unsafe {
+        blst::blst_hash_to_g1(
+            &mut point,
+            MESSAGE.as_ptr(),
+            MESSAGE.len(),
+            DST_G1.as_ptr(),
+            DST_G1.len(),
+            std::ptr::null(),
+            0,
+        );
+        blst::blst_p1_serialize(sswu.as_mut_ptr(), &point);
+    }
+    assert_ne!(result.return_data, sswu.to_vec(), "svdw output cannot equal the sswu suite");
+
+    println!(
+        "witness-assisted SvdW hash_to_G1: {} CU ({} witness bytes)",
+        result.compute_units_consumed,
+        witnesses.len()
+    );
+
+    // the other square root is an equally valid witness and must not
+    // steer the output
+    let flipped = bls381_bench::g1_svdw::witness::flip_first_sqrt(&witnesses);
+    let mut alt = flipped;
+    alt.extend_from_slice(MESSAGE);
+    let same = run(&mollusk, 42, &alt);
+    assert!(!same.program_result.is_err(), "flipped root rejected");
+    assert_eq!(same.return_data, result.return_data, "flipped root changed the point");
+
+    // corrupted witness must abort, not produce a different point
+    let mut bad = payload.clone();
+    let dx_last = witnesses.len() - 1;
+    bad[dx_last] ^= 1;
+    let rejected = run(&mollusk, 42, &bad);
+    assert!(rejected.program_result.is_err(), "corrupt witness was accepted");
+}
+
+#[test]
 fn bench_witness_hash_to_g2() {
     let mollusk = mollusk();
 
@@ -444,6 +520,108 @@ fn bench_witness_hash_to_g2() {
     bad[120] ^= 1;
     let rejected = run(&mollusk, 41, &bad);
     assert!(rejected.program_result.is_err(), "corrupt witness was accepted");
+}
+
+#[test]
+fn bench_witness_svdw_hash_to_g2() {
+    use bls12_381::hash_to_curve::MapToCurve;
+
+    let mollusk = mollusk();
+
+    let witnesses = bls381_bench::g2_svdw::witness::generate(MESSAGE);
+    let mut payload = witnesses.clone();
+    payload.extend_from_slice(MESSAGE);
+
+    let result = run(&mollusk, 43, &payload);
+    assert!(
+        !result.program_result.is_err(),
+        "witnessed svdw hash_to_g2 failed: {:?}",
+        result.program_result
+    );
+
+    // Reference: host-side pre-clearing sum, cofactor cleared through
+    // zkcrypto's clear_h (same Budroni-Pintore construction).
+    let pre = bls381_bench::g2_svdw::witness::reference_preclear(MESSAGE);
+    let aff = Option::<G2Affine>::from(G2Affine::from_uncompressed_unchecked(&pre))
+        .expect("reference point parses");
+    let expected = G2Affine::from(G2Projective::from(aff).clear_h()).to_uncompressed();
+    assert_eq!(result.return_data, expected.to_vec(), "differs from host reference");
+
+    // Different map, different suite: must NOT match the SSWU hash.
+    let mut point = blst::blst_p2::default();
+    let mut sswu = [0u8; 192];
+    unsafe {
+        blst::blst_hash_to_g2(
+            &mut point,
+            MESSAGE.as_ptr(),
+            MESSAGE.len(),
+            DST_G2.as_ptr(),
+            DST_G2.len(),
+            std::ptr::null(),
+            0,
+        );
+        blst::blst_p2_serialize(sswu.as_mut_ptr(), &point);
+    }
+    assert_ne!(result.return_data, sswu.to_vec(), "svdw output cannot equal the sswu suite");
+
+    println!(
+        "witness-assisted SvdW hash_to_G2: {} CU ({} witness bytes)",
+        result.compute_units_consumed,
+        witnesses.len()
+    );
+
+    // the other square root is an equally valid witness and must not
+    // steer the output
+    let flipped = bls381_bench::g2_svdw::witness::flip_first_sqrt(&witnesses);
+    let mut alt = flipped;
+    alt.extend_from_slice(MESSAGE);
+    let same = run(&mollusk, 43, &alt);
+    assert!(!same.program_result.is_err(), "flipped root rejected");
+    assert_eq!(same.return_data, result.return_data, "flipped root changed the point");
+
+    // corrupted witness must abort, not produce a different point
+    let mut bad = payload.clone();
+    let dx_last = witnesses.len() - 1;
+    bad[dx_last] ^= 1;
+    let rejected = run(&mollusk, 43, &bad);
+    assert!(rejected.program_result.is_err(), "corrupt witness was accepted");
+}
+
+#[test]
+fn bench_witness_nu_encode() {
+    let mollusk = mollusk();
+    const DST_G1_NU: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_NU_POP_";
+    const DST_G2_NU: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_NU_POP_";
+
+    let payload = bls381_bench::g1_msig::witness::generate_nu(MESSAGE);
+    let r1 = run(&mollusk, 44, &payload);
+    assert!(!r1.program_result.is_err(), "nu g1: {:?}", r1.program_result);
+    let mut pt = blst::blst_p1::default();
+    let mut ser = [0u8; 96];
+    unsafe {
+        blst::blst_encode_to_g1(&mut pt, MESSAGE.as_ptr(), MESSAGE.len(), DST_G1_NU.as_ptr(), DST_G1_NU.len(), std::ptr::null(), 0);
+        blst::blst_p1_serialize(ser.as_mut_ptr(), &pt);
+    }
+    assert_eq!(r1.return_data, ser.to_vec(), "nu g1 differs from blst encode");
+    println!("witness-assisted NU encode_to_G1: {} CU ({} witness bytes)", r1.compute_units_consumed, payload.len() - MESSAGE.len());
+    let mut bad = payload.clone();
+    bad[60] ^= 1;
+    assert!(run(&mollusk, 44, &bad).program_result.is_err(), "corrupt nu g1 accepted");
+
+    let payload = bls381_bench::g2_msig::witness::generate_nu(MESSAGE);
+    let r2 = run(&mollusk, 45, &payload);
+    assert!(!r2.program_result.is_err(), "nu g2: {:?}", r2.program_result);
+    let mut pt = blst::blst_p2::default();
+    let mut ser = [0u8; 192];
+    unsafe {
+        blst::blst_encode_to_g2(&mut pt, MESSAGE.as_ptr(), MESSAGE.len(), DST_G2_NU.as_ptr(), DST_G2_NU.len(), std::ptr::null(), 0);
+        blst::blst_p2_serialize(ser.as_mut_ptr(), &pt);
+    }
+    assert_eq!(r2.return_data, ser.to_vec(), "nu g2 differs from blst encode");
+    println!("witness-assisted NU encode_to_G2: {} CU ({} witness bytes)", r2.compute_units_consumed, payload.len() - MESSAGE.len());
+    let mut bad = payload.clone();
+    bad[120] ^= 1;
+    assert!(run(&mollusk, 45, &bad).program_result.is_err(), "corrupt nu g2 accepted");
 }
 
 #[test]
