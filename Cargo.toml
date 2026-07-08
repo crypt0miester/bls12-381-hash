@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["program", "bench"]
+members = ["lib", "program", "bench"]
 
 [profile.release]
 overflow-checks = false

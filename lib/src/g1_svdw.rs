@@ -8,16 +8,15 @@
 //! DST is changed accordingly. Interop with existing BLS stacks is the
 //! price of skipping the isogeny.
 
-use solana_program::program_error::ProgramError;
+use solana_program_error::ProgramError;
+use alloc::vec::Vec;
 
-use crate::g2_consts::C256_MONT;
-use crate::g1_consts::{
+use crate::consts_g2::C256_MONT;
+use crate::consts_g1::{
     SVDW_B, SVDW_C1, SVDW_F_U0, SVDW_INV_3U0SQ, SVDW_NEG_U0, SVDW_SQRT_M27, SVDW_U0,
 };
-use crate::g1_msig::{
-    add_mod, be_to_limbs, check_inverse, clear_cofactor, from_mont, is_zero, limbs_to_be,
-    mont_mul, mont_sqr, neg_mod, point_bytes, sub_mod, to_mont, validate, wit48, Fp,
-};
+use crate::fp::*;
+use crate::g1::*;
 
 const DST_SVDW: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SVDW_RO_POP_";
 
@@ -39,7 +38,7 @@ struct PointE1 {
 }
 
 fn expand_message_xmd(msg: &[u8]) -> [[u8; 32]; 4] {
-    use solana_program::hash::hashv;
+    use solana_sha256_hasher::hashv;
 
     let z_pad = [0u8; 64];
     let l_i_b = [0u8, 128];
@@ -213,8 +212,9 @@ pub fn run_witnessed(payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
 #[cfg(not(target_os = "solana"))]
 pub mod witness {
     use super::*;
-    use crate::g1_consts::R;
-    use crate::g1_msig::{exp_inverse, exp_legendre, exp_sqrt};
+    use crate::consts_g1::R;
+    
+    
 
     fn pow_mont(base: &Fp, exp_be: &[u8; 48]) -> Fp {
         let mut acc = R;

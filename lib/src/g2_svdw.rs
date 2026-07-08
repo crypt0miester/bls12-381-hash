@@ -10,15 +10,13 @@
 //! BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_ (blst, EIP-2537), and the
 //! DST is changed accordingly.
 
-use solana_program::program_error::ProgramError;
+use solana_program_error::ProgramError;
+use alloc::vec::Vec;
 
-use crate::g1_msig::{add_mod, mont_mul, sub_mod};
-use crate::g2_consts::{SVDW2_B, SVDW2_C1, SVDW2_F_U0, SVDW2_INV_3U0SQ, SVDW2_SQRT_M3};
-use crate::g2_msig::{
-    add2, add_prime_witnessed, check_inverse2, clear_cofactor, fold, fp2, from_mont2,
-    g2_validate, is_zero2, mul2, neg2, point_bytes, sgn0_fp2, sq2, sub2, to_mont2, wit96,
-    Elem2, Fp2, Point2, ONE2, ZERO,
-};
+use crate::fp::*;
+use crate::consts_g2::{SVDW2_B, SVDW2_C1, SVDW2_F_U0, SVDW2_INV_3U0SQ, SVDW2_SQRT_M3};
+use crate::fp2::*;
+use crate::g2::*;
 
 const DST_SVDW2: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SVDW_RO_POP_";
 
@@ -29,7 +27,7 @@ fn map_witness_len(j: u8) -> usize {
 }
 
 fn expand_message_xmd(msg: &[u8]) -> [[u8; 32]; 8] {
-    use solana_program::hash::hashv;
+    use solana_sha256_hasher::hashv;
 
     let z_pad = [0u8; 64];
     let l_i_b = [1u8, 0];
@@ -207,7 +205,7 @@ pub fn run_witnessed(payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
 #[cfg(not(target_os = "solana"))]
 pub mod witness {
     use super::*;
-    use crate::g2_msig::witness::{inv2, is_square2, push_fp2, push_fp2_mont, sqrt2};
+    use crate::g2::witness::*;
 
     /// Montgomery-form mapped point plus its serialized witness blob.
     fn map_one(t: &Elem2) -> (Point2, Vec<u8>) {

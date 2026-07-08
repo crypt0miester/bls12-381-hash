@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 
 [dev-dependencies]
-bls381-bench = { path = "../program" }
+bls381-hash = { path = "../lib", features = ["full"] }
 mollusk-svm = "=0.13.4"
 solana-instruction = "3"
 solana-pubkey = "4"

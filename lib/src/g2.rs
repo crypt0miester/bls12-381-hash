@@ -8,20 +8,21 @@
 //! clearing mirrors the Budroni-Pintore shape with the two mul-by-x chains
 //! running through the g2 add syscall and the psi maps evaluated in-program.
 
-use solana_program::program_error::ProgramError;
+use solana_program_error::ProgramError;
+use alloc::vec::Vec;
 
-use crate::g1_consts::R;
-use crate::g1_msig::{
-    add_mod, be_to_limbs, from_mont, is_zero, limbs_to_be, mont_mul, neg_mod, sub_mod, sys,
-    to_mont, wit48, Fp,
+use crate::consts_g1::R;
+use crate::fp2::*;
+use crate::fp::{split_witness, 
+    add_mod, be_to_limbs, is_zero, limbs_to_be, mont_mul, neg_mod, sub_mod, sys,
+    to_mont, Fp,
 };
-use crate::g2_consts::{
+use crate::consts_g2::{
     C256_MONT, ISO3A_XDEN, ISO3A_XNUM, ISO3A_YDEN, ISO3A_YNUM, ISO3_XDEN, ISO3_YDEN,
     PSI2_X_C0, PSI_X_C1, PSI_Y,
     SSWU2_C1_NEG_B_OVER_A, SSWU2_ELLP_B,
 };
 
-const DST_G2: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 const BLS_X_ABS: u64 = 0xd201000000010000;
 
 const BLS12_381_G2_BE: u64 = 6 | 0x80;
@@ -32,108 +33,23 @@ const POINT: usize = 192;
 // blob: flag0, y0, flag1, y1, w_tv2_pair, w_dx, w_den_pair
 const W_TOTAL: usize = 2 * (1 + 96) + 3 * 96;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) struct Fp2 {
-    pub(crate) c0: Fp,
-    pub(crate) c1: Fp,
-}
-
-pub(crate) const ZERO: Fp = [0; 6];
-pub(crate) const ONE2: Fp2 = Fp2 { c0: R, c1: ZERO };
-
-pub(crate) fn fp2(k: &[[u64; 6]; 2]) -> Fp2 {
-    Fp2 { c0: k[0], c1: k[1] }
-}
-
-pub(crate) fn add2(a: &Fp2, b: &Fp2) -> Fp2 {
-    Fp2 { c0: add_mod(&a.c0, &b.c0), c1: add_mod(&a.c1, &b.c1) }
-}
-
-pub(crate) fn sub2(a: &Fp2, b: &Fp2) -> Fp2 {
-    Fp2 { c0: sub_mod(&a.c0, &b.c0), c1: sub_mod(&a.c1, &b.c1) }
-}
-
-pub(crate) fn neg2(a: &Fp2) -> Fp2 {
-    Fp2 { c0: neg_mod(&a.c0), c1: neg_mod(&a.c1) }
-}
-
-pub(crate) fn is_zero2(a: &Fp2) -> bool {
-    is_zero(&a.c0) && is_zero(&a.c1)
-}
-
-/// Karatsuba: works whenever the component products are valid mont_mul calls,
-/// so also for canonical-times-Montgomery mixed-domain multiplication.
-#[inline(always)]
-pub(crate) fn mul2(a: &Fp2, b: &Fp2) -> Fp2 {
-    let t0 = mont_mul(&a.c0, &b.c0);
-    let t1 = mont_mul(&a.c1, &b.c1);
-    let sa = add_mod(&a.c0, &a.c1);
-    let sb = add_mod(&b.c0, &b.c1);
-    let t2 = mont_mul(&sa, &sb);
-    Fp2 {
-        c0: sub_mod(&t0, &t1),
-        c1: sub_mod(&sub_mod(&t2, &t0), &t1),
-    }
-}
-
-
-#[inline(always)]
-pub(crate) fn sq2(a: &Fp2) -> Fp2 {
-    let s = add_mod(&a.c0, &a.c1);
-    let d = sub_mod(&a.c0, &a.c1);
-    let t = mont_mul(&a.c0, &a.c1);
-    Fp2 {
-        c0: mont_mul(&s, &d),
-        c1: add_mod(&t, &t),
-    }
-}
-
-pub(crate) fn to_mont2(a: &Fp2) -> Fp2 {
-    Fp2 { c0: to_mont(&a.c0), c1: to_mont(&a.c1) }
-}
-
-pub(crate) fn from_mont2(a: &Fp2) -> Fp2 {
-    Fp2 { c0: from_mont(&a.c0), c1: from_mont(&a.c1) }
-}
-
-pub(crate) fn wit96(bytes: &[u8]) -> Result<Fp2, ProgramError> {
-    Ok(Fp2 {
-        c0: wit48(&bytes[..48])?,
-        c1: wit48(&bytes[48..96])?,
-    })
-}
-
-pub(crate) fn sgn0_fp2(a: &Fp2) -> bool {
-    // canonical form: sign of c0, falling back to c1 when c0 is zero
-    let sign0 = a.c0[0] & 1 == 1;
-    let zero0 = is_zero(&a.c0);
-    let sign1 = a.c1[0] & 1 == 1;
-    sign0 || (zero0 && sign1)
-}
-
-/// Affine point on the 3-isogenous curve E', Montgomery form.
-pub(crate) struct Point2 {
-    pub(crate) x: Fp2,
-    pub(crate) y: Fp2,
-}
-
-fn expand_message_xmd_g2(msg: &[u8]) -> [[u8; 32]; 8] {
-    use solana_program::hash::hashv;
+fn expand_message_xmd_g2(dst: &[u8], msg: &[u8]) -> [[u8; 32]; 8] {
+    use solana_sha256_hasher::hashv;
 
     let z_pad = [0u8; 64];
     let l_i_b = [1u8, 0];
-    let dst_len = [DST_G2.len() as u8];
+    let dst_len = [dst.len() as u8];
 
-    let b0 = hashv(&[&z_pad, msg, &l_i_b, &[0u8], DST_G2, &dst_len]).to_bytes();
+    let b0 = hashv(&[&z_pad, msg, &l_i_b, &[0u8], dst, &dst_len]).to_bytes();
 
     let mut blocks = [[0u8; 32]; 8];
-    blocks[0] = hashv(&[&b0, &[1u8], DST_G2, &dst_len]).to_bytes();
+    blocks[0] = hashv(&[&b0, &[1u8], dst, &dst_len]).to_bytes();
     for i in 1..8 {
         let mut x = [0u8; 32];
         for j in 0..32 {
             x[j] = b0[j] ^ blocks[i - 1][j];
         }
-        blocks[i] = hashv(&[&x, &[i as u8 + 1], DST_G2, &dst_len]).to_bytes();
+        blocks[i] = hashv(&[&x, &[i as u8 + 1], dst, &dst_len]).to_bytes();
     }
     blocks
 }
@@ -155,8 +71,8 @@ pub(crate) fn fold(hi_block: &[u8; 32], lo_block: &[u8; 32]) -> (Fp, Fp) {
     (canonical, to_mont(&canonical))
 }
 
-fn hash_to_field_g2(msg: &[u8]) -> [Elem2; 2] {
-    let blocks = expand_message_xmd_g2(msg);
+fn hash_to_field_g2(dst: &[u8], msg: &[u8]) -> [Elem2; 2] {
+    let blocks = expand_message_xmd_g2(dst, msg);
     let mut elems = [
         Elem2 { canonical: Fp2 { c0: ZERO, c1: ZERO }, mont: Fp2 { c0: ZERO, c1: ZERO } },
         Elem2 { canonical: Fp2 { c0: ZERO, c1: ZERO }, mont: Fp2 { c0: ZERO, c1: ZERO } },
@@ -448,23 +364,22 @@ pub(crate) fn clear_cofactor(p: &[u8; POINT]) -> Result<[u8; POINT], ProgramErro
 }
 
 
-const DST_G2_NU: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_NU_POP_";
 
 /// Single-element hash_to_field for the NU (encode_to_curve) suite.
-fn hash_to_field_nu(msg: &[u8]) -> Elem2 {
-    use solana_program::hash::hashv;
+fn hash_to_field_nu(dst: &[u8], msg: &[u8]) -> Elem2 {
+    use solana_sha256_hasher::hashv;
     let z_pad = [0u8; 64];
     let l_i_b = [0u8, 128];
-    let dst_len = [DST_G2_NU.len() as u8];
-    let b0 = hashv(&[&z_pad, msg, &l_i_b, &[0u8], DST_G2_NU, &dst_len]).to_bytes();
+    let dst_len = [dst.len() as u8];
+    let b0 = hashv(&[&z_pad, msg, &l_i_b, &[0u8], dst, &dst_len]).to_bytes();
     let mut blocks = [[0u8; 32]; 4];
-    blocks[0] = hashv(&[&b0, &[1u8], DST_G2_NU, &dst_len]).to_bytes();
+    blocks[0] = hashv(&[&b0, &[1u8], dst, &dst_len]).to_bytes();
     for i in 1..4 {
         let mut x = [0u8; 32];
         for j in 0..32 {
             x[j] = b0[j] ^ blocks[i - 1][j];
         }
-        blocks[i] = hashv(&[&x, &[i as u8 + 1], DST_G2_NU, &dst_len]).to_bytes();
+        blocks[i] = hashv(&[&x, &[i as u8 + 1], dst, &dst_len]).to_bytes();
     }
     let (c0, m0) = fold(&blocks[0], &blocks[1]);
     let (c1, m1) = fold(&blocks[2], &blocks[3]);
@@ -473,18 +388,15 @@ fn hash_to_field_nu(msg: &[u8]) -> Elem2 {
 
 /// Witnessed encode_to_curve (RFC 9380 NU): one map, no addition.
 /// Blob: flag, y, w_tv2, w_den then the message.
-pub fn run_witnessed_nu(payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
+pub fn encode_to_g2(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
     const NU_TOTAL: usize = 1 + 96 + 96 + 96;
-    if payload.len() < NU_TOTAL {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let (wits, msg) = payload.split_at(NU_TOTAL);
+    let (wits, msg) = split_witness(payload, NU_TOTAL)?;
     let flag = wits[0];
     let y = wit96(&wits[1..97])?;
     let w_tv2 = wit96(&wits[97..193])?;
     let w_den = wit96(&wits[193..])?;
 
-    let u = hash_to_field_nu(msg);
+    let u = hash_to_field_nu(dst, msg);
     let pre = sswu_pre(&u)?;
     let inv = check_inverse2(&pre.tv2, &w_tv2)?;
     let p = sswu_finish(&u, &pre, &inv, flag, &y)?;
@@ -494,11 +406,8 @@ pub fn run_witnessed_nu(payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
     Ok(cleared.to_vec())
 }
 
-pub fn run_witnessed(payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
-    if payload.len() < W_TOTAL {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let (wits, msg) = payload.split_at(W_TOTAL);
+pub fn hash_to_g2(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    let (wits, msg) = split_witness(payload, W_TOTAL)?;
 
     let flag0 = wits[0];
     let y0 = wit96(&wits[1..97])?;
@@ -508,7 +417,7 @@ pub fn run_witnessed(payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
     let w_dx = wit96(&wits[290..386])?;
     let w_den = wit96(&wits[386..482])?;
 
-    let u = hash_to_field_g2(msg);
+    let u = hash_to_field_g2(dst, msg);
     let pre0 = sswu_pre(&u[0])?;
     let pre1 = sswu_pre(&u[1])?;
     let (inv0, inv1) = check_pair_inverse(&pre0.tv2, &pre1.tv2, &w_tv2)?;
@@ -527,7 +436,7 @@ pub fn run_witnessed(payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
 #[cfg(not(target_os = "solana"))]
 pub mod witness {
     use super::*;
-    use crate::g1_msig::{add_carryless, exp_inverse, exp_legendre, exp_sqrt, shr1};
+    use crate::fp::{add_carryless, exp_inverse, exp_legendre, exp_sqrt, shr1};
 
     fn pow_mont(base: &Fp, exp_be: &[u8; 48]) -> Fp {
         let mut acc = R;
@@ -613,8 +522,18 @@ pub mod witness {
         blob.extend_from_slice(&limbs_to_be(&z.c1));
     }
 
+    // The other square root of gx: an equally valid witness that the sign
+    // correction must resolve to the same output point.
+    pub fn flip_first_sqrt(blob: &[u8]) -> Vec<u8> {
+        let y = wit96(&blob[1..97]).unwrap();
+        let mut out = blob[..1].to_vec();
+        push_fp2(&mut out, &to_mont2(&neg2(&y)));
+        out.extend_from_slice(&blob[97..]);
+        out
+    }
+
     pub fn generate_nu(msg: &[u8]) -> Vec<u8> {
-        let u = hash_to_field_nu(msg);
+        let u = hash_to_field_nu(crate::dst::G2_NU, msg);
         let pre = sswu_pre(&u).unwrap();
         let w_tv2 = inv2(&pre.tv2);
         let x1 = mul2(&fp2(&SSWU2_C1_NEG_B_OVER_A), &add2(&ONE2, &w_tv2));
@@ -643,7 +562,7 @@ pub mod witness {
     }
 
     pub fn generate(msg: &[u8]) -> Vec<u8> {
-        let u = hash_to_field_g2(msg);
+        let u = hash_to_field_g2(crate::dst::G2_RO, msg);
         let pre = [sswu_pre(&u[0]).unwrap(), sswu_pre(&u[1]).unwrap()];
 
         let w_tv2 = inv2(&mul2(&pre[0].tv2, &pre[1].tv2));

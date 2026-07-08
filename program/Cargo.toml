@@ -10,5 +10,6 @@ name = "bls381_bench"
 [dependencies]
 solana-program = "=4.0.0"
 solana-define-syscall = "4.0.1"
+bls381-hash = { path = "../lib", features = ["full"] }
 bls12_381 = { version = "0.8.0", default-features = false, features = ["groups", "experimental"] }
 sha2 = { version = "0.9", default-features = false }

@@ -1,12 +1,41 @@
-# bls381-hash-bench
+# bls381-hash
 
-RFC 9380 hash-to-curve for BLS12-381 inside a Solana SBF program, using only
-syscalls that are active on mainnet today. No `big_mod_exp` (SIMD-0529) and no
-map-to-curve syscall. Everything expensive rides in as witness data and gets
-verified with a multiplication or two. Ships with a mollusk compute-unit
-benchmark cross-checked against blst.
+Witness-assisted RFC 9380 hash-to-curve for BLS12-381, for Solana SBF programs.
+`no_std`, allocation-free on-chain, using only syscalls active on mainnet today —
+no `big_mod_exp` (SIMD-0529) and no map-to-curve syscall. Everything expensive
+(inverses, Legendre symbols, square roots) rides in as witness data and is
+verified with a multiplication or two. Host-side witness generation ships in the
+same crate.
 
-## Results
+```rust
+use bls381_hash::{dst, hash_to_g1};
+
+// on-chain verify: DST is a runtime parameter, output is a fixed array
+let point: [u8; 96] = hash_to_g1(dst::G1_RO, message, witness)?;
+```
+
+```rust
+// off-chain (host): build the witness for a message
+let witness = bls381_hash::witness::g1::generate(message);
+```
+
+## Features
+
+| feature | pulls in |
+|---|---|
+| `ro` (default) | `g1-ro` + `g2-ro`, the blst-compatible pair |
+| `g1-ro`, `g2-ro` | standard `_SSWU_RO_POP_` pipelines |
+| `g1-nu`, `g2-nu` | RFC 9380 encode_to_curve variants |
+| `g1-svdw`, `g2-svdw` | custom-suite SvdW variants (no isogeny) |
+| `modexp` | big_mod_exp-assisted G1 path, needs SIMD-0529 |
+| `full` | everything above |
+
+The `lib/` crate is the product; `program/` is an SBF tag-dispatch fixture and
+`bench/` the mollusk benchmark.
+
+## Benchmark
+
+Measured against the fixture with blst cross-checks.
 
 Measured with mollusk 0.13.4 on the agave 4.0 stack, SBF v3.
 

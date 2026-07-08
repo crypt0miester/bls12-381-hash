@@ -510,6 +510,7 @@ name = "bls381-bench"
 version = "0.1.0"
 dependencies = [
  "bls12_381",
+ "bls381-hash",
  "sha2 0.9.9",
  "solana-define-syscall 4.0.1",
  "solana-program",
@@ -520,13 +521,22 @@ name = "bls381-bench-tests"
 version = "0.1.0"
 dependencies = [
  "bls12_381",
- "bls381-bench",
+ "bls381-hash",
  "blst",
  "hex",
  "mollusk-svm",
  "sha2 0.9.9",
  "solana-instruction",
  "solana-pubkey 4.1.0",
+]
+
+[[package]]
+name = "bls381-hash"
+version = "0.1.0"
+dependencies = [
+ "solana-define-syscall 4.0.1",
+ "solana-program-error",
+ "solana-sha256-hasher",
 ]
 
 [[package]]

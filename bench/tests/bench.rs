@@ -279,7 +279,7 @@ fn bench_syscall_assisted_hash_to_g1() {
     type F = <G1Projective as MapToCurve>::Field;
     let mut u = [F::default(); 2];
     F::hash_to_field::<ExpandMsgXmd<sha2::Sha256>>(MESSAGE, DST_G1, &mut u);
-    let sum = G1Projective::map_to_curve(&u[0]) + &G1Projective::map_to_curve(&u[1]);
+    let sum = G1Projective::map_to_curve(&u[0]) + G1Projective::map_to_curve(&u[1]);
     let expected_uncleared = G1Affine::from(sum).to_uncompressed();
     assert_eq!(
         iso.return_data,
@@ -324,47 +324,10 @@ fn bench_syscall_assisted_hash_to_g1() {
 }
 
 #[test]
-fn bench_mont_mul() {
-    let mollusk = mollusk();
-    let base = run(&mollusk, 34, &0u64.to_le_bytes());
-    let loop_2k = run(&mollusk, 34, &2000u64.to_le_bytes());
-    assert!(!base.program_result.is_err());
-    assert!(!loop_2k.program_result.is_err());
-    let per_op =
-        (loop_2k.compute_units_consumed - base.compute_units_consumed) as f64 / 2000.0;
-    println!(
-        "mont_mul: base={} loop2k={} per_op={:.0} CU",
-        base.compute_units_consumed, loop_2k.compute_units_consumed, per_op
-    );
-}
-
-#[test]
-fn bench_mul_variants() {
-    let mollusk = mollusk();
-    let mut results = vec![];
-    for (variant, name) in [(0u8, "sos64"), (1, "cios64"), (2, "cios32")] {
-        let mut base_data = vec![variant];
-        base_data.extend_from_slice(&0u64.to_le_bytes());
-        let mut loop_data = vec![variant];
-        loop_data.extend_from_slice(&2000u64.to_le_bytes());
-        let base = run(&mollusk, 35, &base_data);
-        let looped = run(&mollusk, 35, &loop_data);
-        assert!(!looped.program_result.is_err(), "{name} failed");
-        let per_op =
-            (looped.compute_units_consumed - base.compute_units_consumed) as f64 / 2000.0;
-        println!("{name}: per_op={per_op:.0} CU");
-        results.push(looped.return_data.clone());
-    }
-    assert_eq!(results[0], results[1], "cios64 disagrees with sos64");
-    assert_eq!(results[0], results[2], "cios32 disagrees with sos64");
-    bls381_bench::g1_msig::witness::iso11_adapted_selftest();
-}
-
-#[test]
 fn bench_witness_hash_to_g1() {
     let mollusk = mollusk();
 
-    let witnesses = bls381_bench::g1_msig::witness::generate(MESSAGE);
+    let witnesses = bls381_hash::witness::g1::generate(MESSAGE);
     let mut payload = witnesses.clone();
     payload.extend_from_slice(MESSAGE);
 
@@ -408,7 +371,7 @@ fn bench_witness_hash_to_g1() {
 fn bench_witness_svdw_hash_to_g1() {
     let mollusk = mollusk();
 
-    let witnesses = bls381_bench::g1_svdw::witness::generate(MESSAGE);
+    let witnesses = bls381_hash::witness::g1_svdw::generate(MESSAGE);
     let mut payload = witnesses.clone();
     payload.extend_from_slice(MESSAGE);
 
@@ -421,7 +384,7 @@ fn bench_witness_svdw_hash_to_g1() {
 
     // Reference: host-side pre-clearing sum, effective cofactor applied
     // through zkcrypto scalar multiplication.
-    let pre = bls381_bench::g1_svdw::witness::reference_preclear(MESSAGE);
+    let pre = bls381_hash::witness::g1_svdw::reference_preclear(MESSAGE);
     let aff = Option::<G1Affine>::from(G1Affine::from_uncompressed_unchecked(&pre))
         .expect("reference point parses");
     let expected = G1Affine::from(G1Projective::from(aff) * Scalar::from(0xd201000000010001u64))
@@ -453,7 +416,7 @@ fn bench_witness_svdw_hash_to_g1() {
 
     // the other square root is an equally valid witness and must not
     // steer the output
-    let flipped = bls381_bench::g1_svdw::witness::flip_first_sqrt(&witnesses);
+    let flipped = bls381_hash::witness::g1_svdw::flip_first_sqrt(&witnesses);
     let mut alt = flipped;
     alt.extend_from_slice(MESSAGE);
     let same = run(&mollusk, 42, &alt);
@@ -472,7 +435,7 @@ fn bench_witness_svdw_hash_to_g1() {
 fn bench_witness_hash_to_g2() {
     let mollusk = mollusk();
 
-    let witnesses = bls381_bench::g2_msig::witness::generate(MESSAGE);
+    let witnesses = bls381_hash::witness::g2::generate(MESSAGE);
     let mut payload = witnesses.clone();
     payload.extend_from_slice(MESSAGE);
 
@@ -511,13 +474,110 @@ fn bench_witness_hash_to_g2() {
     assert!(rejected.program_result.is_err(), "corrupt witness was accepted");
 }
 
+// No witness byte can steer the output: every single-bit corruption of the G2
+// witness must abort or reproduce the exact same point. Also covers the branch
+// flag range, canonical-form parsing, and message binding.
+#[test]
+fn witness_g2_soundness() {
+    let mollusk = mollusk();
+
+    let witness = bls381_hash::witness::g2::generate(MESSAGE);
+    let mut payload = witness.clone();
+    payload.extend_from_slice(MESSAGE);
+
+    let good = run(&mollusk, 41, &payload);
+    assert!(!good.program_result.is_err(), "honest witness rejected");
+    let truth = good.return_data.clone();
+
+    for i in 0..witness.len() {
+        let mut bad = payload.clone();
+        bad[i] ^= 1;
+        let r = run(&mollusk, 41, &bad);
+        if !r.program_result.is_err() {
+            assert_eq!(r.return_data, truth, "witness byte {i} steered the output");
+        }
+    }
+
+    // a branch flag above 1 is non-canonical
+    for flag in [0usize, 97] {
+        let mut bad = payload.clone();
+        bad[flag] = 2;
+        assert!(run(&mollusk, 41, &bad).program_result.is_err(), "flag=2 at {flag} accepted");
+    }
+
+    // a witness limb at or above the modulus must be rejected by the parser
+    let mut oob = payload.clone();
+    for byte in oob[1..49].iter_mut() {
+        *byte = 0xff;
+    }
+    assert!(run(&mollusk, 41, &oob).program_result.is_err(), "out-of-range witness accepted");
+
+    // the witness is bound to the message it was generated for
+    let mut replay = witness.clone();
+    replay.extend_from_slice(b"a different snapshot vote payload");
+    assert!(run(&mollusk, 41, &replay).program_result.is_err(), "cross-message replay accepted");
+
+    // the other square root is an equally valid witness and must not steer
+    let mut alt = bls381_hash::witness::g2::flip_first_sqrt(&witness);
+    alt.extend_from_slice(MESSAGE);
+    let same = run(&mollusk, 41, &alt);
+    assert!(!same.program_result.is_err(), "flipped root rejected");
+    assert_eq!(same.return_data, truth, "flipped root changed the point");
+}
+
+// The G1 (min-sig) counterpart of the G2 soundness sweep.
+#[test]
+fn witness_g1_soundness() {
+    let mollusk = mollusk();
+
+    let witness = bls381_hash::witness::g1::generate(MESSAGE);
+    let mut payload = witness.clone();
+    payload.extend_from_slice(MESSAGE);
+
+    let good = run(&mollusk, 40, &payload);
+    assert!(!good.program_result.is_err(), "honest witness rejected");
+    let truth = good.return_data.clone();
+
+    for i in 0..witness.len() {
+        let mut bad = payload.clone();
+        bad[i] ^= 1;
+        let r = run(&mollusk, 40, &bad);
+        if !r.program_result.is_err() {
+            assert_eq!(r.return_data, truth, "witness byte {i} steered the output");
+        }
+    }
+
+    for flag in [0usize, 97] {
+        let mut bad = payload.clone();
+        bad[flag] = 2;
+        assert!(run(&mollusk, 40, &bad).program_result.is_err(), "flag=2 at {flag} accepted");
+    }
+
+    let mut oob = payload.clone();
+    for byte in oob[1..49].iter_mut() {
+        *byte = 0xff;
+    }
+    assert!(run(&mollusk, 40, &oob).program_result.is_err(), "out-of-range witness accepted");
+
+    let mut replay = witness.clone();
+    replay.extend_from_slice(b"a different snapshot vote payload");
+    assert!(run(&mollusk, 40, &replay).program_result.is_err(), "cross-message replay accepted");
+
+    // the other square root is an equally valid witness and must not steer
+    let mut alt = bls381_hash::witness::g1::flip_first_sqrt(&witness);
+    alt.extend_from_slice(MESSAGE);
+    let same = run(&mollusk, 40, &alt);
+    assert!(!same.program_result.is_err(), "flipped root rejected");
+    assert_eq!(same.return_data, truth, "flipped root changed the point");
+}
+
 #[test]
 fn bench_witness_svdw_hash_to_g2() {
     use bls12_381::hash_to_curve::MapToCurve;
 
     let mollusk = mollusk();
 
-    let witnesses = bls381_bench::g2_svdw::witness::generate(MESSAGE);
+    let witnesses = bls381_hash::witness::g2_svdw::generate(MESSAGE);
     let mut payload = witnesses.clone();
     payload.extend_from_slice(MESSAGE);
 
@@ -530,7 +590,7 @@ fn bench_witness_svdw_hash_to_g2() {
 
     // Reference: host-side pre-clearing sum, cofactor cleared through
     // zkcrypto's clear_h (same Budroni-Pintore construction).
-    let pre = bls381_bench::g2_svdw::witness::reference_preclear(MESSAGE);
+    let pre = bls381_hash::witness::g2_svdw::reference_preclear(MESSAGE);
     let aff = Option::<G2Affine>::from(G2Affine::from_uncompressed_unchecked(&pre))
         .expect("reference point parses");
     let expected = G2Affine::from(G2Projective::from(aff).clear_h()).to_uncompressed();
@@ -561,7 +621,7 @@ fn bench_witness_svdw_hash_to_g2() {
 
     // the other square root is an equally valid witness and must not
     // steer the output
-    let flipped = bls381_bench::g2_svdw::witness::flip_first_sqrt(&witnesses);
+    let flipped = bls381_hash::witness::g2_svdw::flip_first_sqrt(&witnesses);
     let mut alt = flipped;
     alt.extend_from_slice(MESSAGE);
     let same = run(&mollusk, 43, &alt);
@@ -582,7 +642,7 @@ fn bench_witness_nu_encode() {
     const DST_G1_NU: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_NU_POP_";
     const DST_G2_NU: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_NU_POP_";
 
-    let payload = bls381_bench::g1_msig::witness::generate_nu(MESSAGE);
+    let payload = bls381_hash::witness::g1::generate_nu(MESSAGE);
     let r1 = run(&mollusk, 44, &payload);
     assert!(!r1.program_result.is_err(), "nu g1: {:?}", r1.program_result);
     let mut pt = blst::blst_p1::default();
@@ -597,7 +657,7 @@ fn bench_witness_nu_encode() {
     bad[60] ^= 1;
     assert!(run(&mollusk, 44, &bad).program_result.is_err(), "corrupt nu g1 accepted");
 
-    let payload = bls381_bench::g2_msig::witness::generate_nu(MESSAGE);
+    let payload = bls381_hash::witness::g2::generate_nu(MESSAGE);
     let r2 = run(&mollusk, 45, &payload);
     assert!(!r2.program_result.is_err(), "nu g2: {:?}", r2.program_result);
     let mut pt = blst::blst_p2::default();
@@ -631,7 +691,7 @@ fn bench_min_pk_verify_end_to_end() {
         .unwrap()
         .to_public_key();
 
-    let witness = bls381_bench::g2_msig::witness::generate(MESSAGE);
+    let witness = bls381_hash::witness::g2::generate(MESSAGE);
 
     for k in [14usize, 20] {
         let sigs: Vec<Signature> = keys[..k]

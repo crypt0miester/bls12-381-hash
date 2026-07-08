@@ -1,13 +1,12 @@
 #![allow(unexpected_cfgs)]
 
-mod g1_consts;
-pub mod g1_msig;
-pub mod g1_svdw;
-mod g2_consts;
-pub mod g2_msig;
-pub mod g2_svdw;
-
 use core::hint::black_box;
+
+use bls381_hash::dst::{G1_NU, G1_RO, G2_NU, G2_RO};
+use bls381_hash::{
+    encode_to_g1, encode_to_g2, hash_to_g1, hash_to_g1_modexp, hash_to_g1_svdw, hash_to_g2,
+    hash_to_g2_svdw,
+};
 
 use bls12_381::{
     hash_to_curve::{ExpandMsgXmd, HashToCurve, HashToField, MapToCurve},
@@ -23,8 +22,6 @@ use solana_program::{
     pubkey::Pubkey,
 };
 
-const DST_G2: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
-const DST_G1: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_";
 
 const BLS12_381_PAIRING_BE: u64 = 4 | 0x80;
 const BLS12_381_G1_BE: u64 = 5 | 0x80;
@@ -98,13 +95,13 @@ fn process_instruction(
         // can subtract successive results to isolate each phase.
         0 => {
             let p = <G2Projective as HashToCurve<ExpandMsgXmd<Sha256>>>::hash_to_curve(
-                payload, DST_G2,
+                payload, G2_RO,
             );
             set_return_data(&G2Affine::from(p).to_compressed());
         }
         1 => {
             let p = <G1Projective as HashToCurve<ExpandMsgXmd<Sha256>>>::hash_to_curve(
-                payload, DST_G1,
+                payload, G1_RO,
             );
             set_return_data(&G1Affine::from(p).to_compressed());
         }
@@ -114,12 +111,12 @@ fn process_instruction(
         }
         3 => {
             let u = hash_to_field_g2(payload);
-            let p = G2Projective::map_to_curve(&u[0]) + &G2Projective::map_to_curve(&u[1]);
+            let p = G2Projective::map_to_curve(&u[0]) + G2Projective::map_to_curve(&u[1]);
             black_box(&p);
         }
         4 => {
             let u = hash_to_field_g2(payload);
-            let p = (G2Projective::map_to_curve(&u[0]) + &G2Projective::map_to_curve(&u[1]))
+            let p = (G2Projective::map_to_curve(&u[0]) + G2Projective::map_to_curve(&u[1]))
                 .clear_h();
             black_box(&p);
         }
@@ -251,14 +248,8 @@ fn process_instruction(
         }
         // Syscall-assisted min-sig hash_to_G1, cumulative stage prefixes.
         30..=33 => {
-            let out = g1_msig::run(tag - 30, payload)?;
+            let out = hash_to_g1_modexp(G1_RO, tag - 30, payload)?;
             set_return_data(&out);
-        }
-        34 => {
-            expect_len(payload, 8)?;
-            let count = u64::from_le_bytes(payload.try_into().unwrap());
-            let acc = g1_msig::mont_mul_bench(count);
-            set_return_data(&acc.to_le_bytes());
         }
         // End-to-end min-pk vote verify: witness hash_to_G2, subtract the
         // absentees from the stored committee aggregate, check the pairing
@@ -315,7 +306,7 @@ fn process_instruction(
                 return Err(ProgramError::InvalidInstructionData);
             }
 
-            let hash = g2_msig::run_witnessed(&payload[abs_end..])?;
+            let hash = hash_to_g2(G2_RO, &payload[abs_end..])?;
 
             let mut gt_left = [0u8; GT];
             let rc = unsafe {
@@ -346,37 +337,31 @@ fn process_instruction(
             set_return_data(&[1]);
         }
         40 => {
-            let out = g1_msig::run_witnessed(payload)?;
+            let out = hash_to_g1(G1_RO, payload)?;
             set_return_data(&out);
         }
         41 => {
-            let out = g2_msig::run_witnessed(payload)?;
+            let out = hash_to_g2(G2_RO, payload)?;
             set_return_data(&out);
         }
         // Witnessed SvdW direct-map hash_to_G1: no isogeny, custom suite.
         42 => {
-            let out = g1_svdw::run_witnessed(payload)?;
+            let out = hash_to_g1_svdw(payload)?;
             set_return_data(&out);
         }
         // Witnessed encode_to_curve (RFC 9380 NU suites): single map.
         44 => {
-            let out = g1_msig::run_witnessed_nu(payload)?;
+            let out = encode_to_g1(G1_NU, payload)?;
             set_return_data(&out);
         }
         45 => {
-            let out = g2_msig::run_witnessed_nu(payload)?;
+            let out = encode_to_g2(G2_NU, payload)?;
             set_return_data(&out);
         }
         // Witnessed SvdW direct-map hash_to_G2: no isogeny, custom suite.
         43 => {
-            let out = g2_svdw::run_witnessed(payload)?;
+            let out = hash_to_g2_svdw(payload)?;
             set_return_data(&out);
-        }
-        35 => {
-            expect_len(payload, 9)?;
-            let count = u64::from_le_bytes(payload[1..].try_into().unwrap());
-            let acc = g1_msig::mul_bench(payload[0], count);
-            set_return_data(&acc.to_le_bytes());
         }
         21 => {
             expect_len(payload, 8)?;
@@ -399,7 +384,7 @@ type FieldG2 = <G2Projective as MapToCurve>::Field;
 
 fn hash_to_field_g2(payload: &[u8]) -> [FieldG2; 2] {
     let mut u = [FieldG2::default(); 2];
-    FieldG2::hash_to_field::<ExpandMsgXmd<Sha256>>(payload, DST_G2, &mut u);
+    FieldG2::hash_to_field::<ExpandMsgXmd<Sha256>>(payload, G2_RO, &mut u);
     u
 }
 

@@ -7,279 +7,42 @@
 //! mapped points added on the isogenous curve so the isogeny runs once, and
 //! cofactor clearing as a double-and-add chain over the g1 add syscall.
 
-use solana_program::program_error::ProgramError;
+use solana_program_error::ProgramError;
+use alloc::vec::Vec;
 
-use crate::g1_consts::{
-    INV, ISO11A_XDEN, ISO11A_XNUM, ISO11A_YDEN, ISO11A_YNUM, ISO11_XDEN, ISO11_XNUM, ISO11_YDEN,
-    ISO11_YNUM, MODULUS, R, R2, SSWU_ELLP_A, SSWU_ELLP_B,
+use crate::consts_g1::{
+    ISO11A_XDEN, ISO11A_XNUM, ISO11A_YDEN, ISO11A_YNUM, ISO11_XDEN, ISO11_XNUM, ISO11_YDEN,
+    ISO11_YNUM, R, R2, SSWU_ELLP_A, SSWU_ELLP_B,
 };
-use crate::g2_consts::C256_MONT;
+use crate::consts_g2::C256_MONT;
+use crate::fp::*;
 
-const DST_G1: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_";
 const H_EFF: u64 = 0xd201000000010001;
 
-pub(crate) type Fp = [u64; 6];
-
-const ONE: Fp = [1, 0, 0, 0, 0, 0];
-
-#[inline(always)]
-fn mul_64x64(a: u64, b: u64) -> (u64, u64) {
-    let a_lo = a & 0xffff_ffff;
-    let a_hi = a >> 32;
-    let b_lo = b & 0xffff_ffff;
-    let b_hi = b >> 32;
-    let p0 = a_lo * b_lo;
-    let p1 = a_lo * b_hi;
-    let p2 = a_hi * b_lo;
-    let p3 = a_hi * b_hi;
-    let mid = (p0 >> 32) + (p1 & 0xffff_ffff) + (p2 & 0xffff_ffff);
-    let lo = (p0 & 0xffff_ffff) | (mid << 32);
-    let hi = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
-    (lo, hi)
-}
-
-#[inline(always)]
-fn mac(acc: u64, a: u64, b: u64, carry: u64) -> (u64, u64) {
-    let (lo, hi) = mul_64x64(a, b);
-    let (lo, c1) = lo.overflowing_add(acc);
-    let (lo, c2) = lo.overflowing_add(carry);
-    (lo, hi + c1 as u64 + c2 as u64)
-}
-
-#[inline(always)]
-fn adc(a: u64, b: u64, carry: u64) -> (u64, u64) {
-    let (s, c1) = a.overflowing_add(b);
-    let (s, c2) = s.overflowing_add(carry);
-    (s, c1 as u64 + c2 as u64)
-}
-
-#[inline(always)]
-fn sbb(a: u64, b: u64, borrow: u64) -> (u64, u64) {
-    let (d, b1) = a.overflowing_sub(b);
-    let (d, b2) = d.overflowing_sub(borrow);
-    (d, b1 as u64 + b2 as u64)
-}
-
-pub(crate) fn geq(a: &Fp, b: &Fp) -> bool {
-    for i in (0..6).rev() {
-        if a[i] > b[i] {
-            return true;
-        }
-        if a[i] < b[i] {
-            return false;
-        }
-    }
-    true
-}
-
-pub(crate) fn sub_nocheck(a: &Fp, b: &Fp) -> Fp {
-    let mut r = [0u64; 6];
-    let mut borrow = 0u64;
-    for i in 0..6 {
-        let (d, br) = sbb(a[i], b[i], borrow);
-        r[i] = d;
-        borrow = br;
-    }
-    r
-}
-
-#[inline(always)]
-pub(crate) fn add_mod(a: &Fp, b: &Fp) -> Fp {
-    let mut r = [0u64; 6];
-    let mut carry = 0u64;
-    for i in 0..6 {
-        let (s, c) = adc(a[i], b[i], carry);
-        r[i] = s;
-        carry = c;
-    }
-    if carry != 0 || geq(&r, &MODULUS) {
-        r = sub_nocheck(&r, &MODULUS);
-    }
-    r
-}
-
-#[inline(always)]
-pub(crate) fn sub_mod(a: &Fp, b: &Fp) -> Fp {
-    if geq(a, b) {
-        sub_nocheck(a, b)
-    } else {
-        add_carryless(&sub_nocheck(a, b))
-    }
-}
-
-pub(crate) fn add_carryless(r: &Fp) -> Fp {
-    // wrapped subtraction result plus p restores the field value
-    let mut out = [0u64; 6];
-    let mut carry = 0u64;
-    for i in 0..6 {
-        let (s, c) = adc(r[i], MODULUS[i], carry);
-        out[i] = s;
-        carry = c;
-    }
-    out
-}
-
-pub(crate) fn neg_mod(a: &Fp) -> Fp {
-    if a.iter().all(|&l| l == 0) {
-        return [0u64; 6];
-    }
-    sub_nocheck(&MODULUS, a)
-}
-
-pub(crate) fn is_zero(a: &Fp) -> bool {
-    a.iter().all(|&l| l == 0)
-}
-
-pub(crate) fn mont_mul(a: &Fp, b: &Fp) -> Fp {
-    mont_mul_cios32(a, b)
-}
-
-/// Square through the general multiply; a dedicated squaring does not
-/// pay for itself on sbpf.
-pub(crate) fn mont_sqr(a: &Fp) -> Fp {
-    mont_mul_cios32(a, a)
-}
-
-
-pub(crate) fn to_mont(a: &Fp) -> Fp {
-    mont_mul(a, &R2)
-}
-
-pub(crate) fn from_mont(a: &Fp) -> Fp {
-    mont_mul(a, &ONE)
-}
-
-pub(crate) fn limbs_to_be(a: &Fp) -> [u8; 48] {
-    let mut out = [0u8; 48];
-    for i in 0..6 {
-        out[i * 8..i * 8 + 8].copy_from_slice(&a[5 - i].to_be_bytes());
-    }
-    out
-}
-
-pub(crate) fn be_to_limbs(b: &[u8; 48]) -> Fp {
-    let mut r = [0u64; 6];
-    for i in 0..6 {
-        r[5 - i] = u64::from_be_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
-    }
-    r
-}
-
-pub(crate) fn shr1(a: &Fp) -> Fp {
-    let mut r = [0u64; 6];
-    for i in 0..6 {
-        r[i] = a[i] >> 1;
-        if i < 5 {
-            r[i] |= a[i + 1] << 63;
-        }
-    }
-    r
-}
-
-pub(crate) fn exp_inverse() -> [u8; 48] {
-    limbs_to_be(&sub_nocheck(&MODULUS, &[2, 0, 0, 0, 0, 0]))
-}
-
-pub(crate) fn exp_legendre() -> [u8; 48] {
-    limbs_to_be(&shr1(&sub_nocheck(&MODULUS, &ONE)))
-}
-
-pub(crate) fn exp_sqrt() -> [u8; 48] {
-    let mut p1 = MODULUS;
-    p1[0] += 1;
-    limbs_to_be(&shr1(&shr1(&p1)))
-}
-
-#[cfg(target_os = "solana")]
-pub(crate) mod sys {
-    use solana_define_syscall::define_syscall;
-
-    define_syscall!(fn sol_curve_validate_point(curve_id: u64, point_addr: *const u8, result: *mut u8) -> u64);
-    define_syscall!(fn sol_curve_group_op(curve_id: u64, group_op: u64, left_input_addr: *const u8, right_input_addr: *const u8, result_point_addr: *mut u8) -> u64);
-    define_syscall!(fn sol_big_mod_exp(params: *const u8, result: *mut u8) -> u64);
-}
-
-#[cfg(not(target_os = "solana"))]
-#[allow(clippy::missing_safety_doc)]
-pub(crate) mod sys {
-    pub unsafe fn sol_curve_validate_point(_: u64, _: *const u8, _: *mut u8) -> u64 {
-        unimplemented!()
-    }
-    pub unsafe fn sol_curve_group_op(_: u64, _: u64, _: *const u8, _: *const u8, _: *mut u8) -> u64 {
-        unimplemented!()
-    }
-    pub unsafe fn sol_big_mod_exp(_: *const u8, _: *mut u8) -> u64 {
-        unimplemented!()
-    }
-}
-
-#[repr(C)]
-struct BigModExpParams {
-    base: *const u8,
-    base_len: u64,
-    exponent: *const u8,
-    exponent_len: u64,
-    modulus: *const u8,
-    modulus_len: u64,
-}
-
-fn modexp_bytes(base: &[u8], exp: &[u8]) -> Result<[u8; 48], ProgramError> {
-    let modulus = limbs_to_be(&MODULUS);
-    let params = BigModExpParams {
-        base: base.as_ptr(),
-        base_len: base.len() as u64,
-        exponent: exp.as_ptr(),
-        exponent_len: exp.len() as u64,
-        modulus: modulus.as_ptr(),
-        modulus_len: 48,
-    };
-    let mut out = [0u8; 48];
-    let rc = unsafe {
-        sys::sol_big_mod_exp(
-            &params as *const BigModExpParams as *const u8,
-            out.as_mut_ptr(),
-        )
-    };
-    if rc != 0 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    Ok(out)
-}
-
-/// Modular exponentiation of a canonical-form element, returning canonical.
-fn modexp(base: &Fp, exp: &[u8; 48]) -> Result<Fp, ProgramError> {
-    Ok(be_to_limbs(&modexp_bytes(&limbs_to_be(base), exp)?))
-}
-
-/// Inverse of a Montgomery-form element, returned in Montgomery form.
-fn inverse_mont(a: &Fp, exp_inv: &[u8; 48]) -> Result<Fp, ProgramError> {
-    Ok(to_mont(&modexp(&from_mont(a), exp_inv)?))
-}
-
-fn expand_message_xmd(msg: &[u8]) -> [[u8; 32]; 4] {
-    use solana_program::hash::hashv;
+fn expand_message_xmd(dst: &[u8], msg: &[u8]) -> [[u8; 32]; 4] {
+    use solana_sha256_hasher::hashv;
 
     let z_pad = [0u8; 64];
     let l_i_b = [0u8, 128];
-    let dst_len = [DST_G1.len() as u8];
+    let dst_len = [dst.len() as u8];
 
-    let b0 = hashv(&[&z_pad, msg, &l_i_b, &[0u8], DST_G1, &dst_len]).to_bytes();
+    let b0 = hashv(&[&z_pad, msg, &l_i_b, &[0u8], dst, &dst_len]).to_bytes();
 
     let mut blocks = [[0u8; 32]; 4];
-    blocks[0] = hashv(&[&b0, &[1u8], DST_G1, &dst_len]).to_bytes();
+    blocks[0] = hashv(&[&b0, &[1u8], dst, &dst_len]).to_bytes();
     for i in 1..4 {
         let mut x = [0u8; 32];
         for j in 0..32 {
             x[j] = b0[j] ^ blocks[i - 1][j];
         }
-        blocks[i] = hashv(&[&x, &[i as u8 + 1], DST_G1, &dst_len]).to_bytes();
+        blocks[i] = hashv(&[&x, &[i as u8 + 1], dst, &dst_len]).to_bytes();
     }
     blocks
 }
 
 /// hash_to_field for two Fp elements, canonical form.
-fn hash_to_field(msg: &[u8]) -> Result<[Fp; 2], ProgramError> {
-    let blocks = expand_message_xmd(msg);
+fn hash_to_field(dst: &[u8], msg: &[u8]) -> Result<[Fp; 2], ProgramError> {
+    let blocks = expand_message_xmd(dst, msg);
     let one = [1u8];
 
     let mut wide = [0u8; 64];
@@ -401,7 +164,7 @@ pub(crate) fn iso11_adapted(x: &Fp) -> (Fp, Fp, Fp, Fp) {
         &mont_mul(&add_mod(x, &ISO11A_XNUM[0]), &add_mod(&w, &ISO11A_XNUM[1])),
         &ISO11A_XNUM[2],
     );
-    let mut t = add_mod(&w, &ISO11A_XNUM[3]);
+    let t = add_mod(&w, &ISO11A_XNUM[3]);
     xnum = add_mod(&mont_mul(&xnum, &t), &ISO11A_XNUM[4]);
     let mut t = add_mod(&w, &ISO11A_XNUM[5]);
     t = add_mod(&t, x);
@@ -411,7 +174,7 @@ pub(crate) fn iso11_adapted(x: &Fp) -> (Fp, Fp, Fp, Fp) {
     t = add_mod(&t, x);
     t = add_mod(&t, x);
     xnum = add_mod(&mont_mul(&xnum, &t), &ISO11A_XNUM[8]);
-    let mut t = add_mod(&w, &ISO11A_XNUM[9]);
+    let t = add_mod(&w, &ISO11A_XNUM[9]);
     xnum = add_mod(&mont_mul(&xnum, &t), &ISO11A_XNUM[10]);
     let xnum = mont_mul(&xnum, &ISO11A_XNUM[11]);
 
@@ -436,18 +199,18 @@ pub(crate) fn iso11_adapted(x: &Fp) -> (Fp, Fp, Fp, Fp) {
     let mut t = add_mod(&w, &ISO11A_YNUM[3]);
     t = add_mod(&t, x);
     ynum = add_mod(&mont_mul(&ynum, &t), &ISO11A_YNUM[4]);
-    let mut t = add_mod(&w, &ISO11A_YNUM[5]);
+    let t = add_mod(&w, &ISO11A_YNUM[5]);
     ynum = add_mod(&mont_mul(&ynum, &t), &ISO11A_YNUM[6]);
     let mut t = add_mod(&w, &ISO11A_YNUM[7]);
     t = add_mod(&t, x);
     ynum = add_mod(&mont_mul(&ynum, &t), &ISO11A_YNUM[8]);
-    let mut t = add_mod(&w, &ISO11A_YNUM[9]);
+    let t = add_mod(&w, &ISO11A_YNUM[9]);
     ynum = add_mod(&mont_mul(&ynum, &t), &ISO11A_YNUM[10]);
     let mut t = add_mod(&w, &ISO11A_YNUM[11]);
     t = add_mod(&t, x);
     t = add_mod(&t, x);
     ynum = add_mod(&mont_mul(&ynum, &t), &ISO11A_YNUM[12]);
-    let mut t = add_mod(&w, &ISO11A_YNUM[13]);
+    let t = add_mod(&w, &ISO11A_YNUM[13]);
     ynum = add_mod(&mont_mul(&ynum, &t), &ISO11A_YNUM[14]);
     let ynum = mont_mul(&ynum, &ISO11A_YNUM[15]);
 
@@ -462,14 +225,14 @@ pub(crate) fn iso11_adapted(x: &Fp) -> (Fp, Fp, Fp, Fp) {
     t = add_mod(&t, x);
     t = add_mod(&t, x);
     yden = add_mod(&mont_mul(&yden, &t), &ISO11A_YDEN[6]);
-    let mut t = add_mod(&w, &ISO11A_YDEN[7]);
+    let t = add_mod(&w, &ISO11A_YDEN[7]);
     yden = add_mod(&mont_mul(&yden, &t), &ISO11A_YDEN[8]);
     let mut t = add_mod(&w, &ISO11A_YDEN[9]);
     t = add_mod(&t, x);
     yden = add_mod(&mont_mul(&yden, &t), &ISO11A_YDEN[10]);
-    let mut t = add_mod(&w, &ISO11A_YDEN[11]);
+    let t = add_mod(&w, &ISO11A_YDEN[11]);
     yden = add_mod(&mont_mul(&yden, &t), &ISO11A_YDEN[12]);
-    let mut t = add_mod(&w, &ISO11A_YDEN[13]);
+    let t = add_mod(&w, &ISO11A_YDEN[13]);
     yden = add_mod(&mont_mul(&yden, &t), &ISO11A_YDEN[14]);
 
     (xnum, xden, ynum, yden)
@@ -555,8 +318,8 @@ fn c_neg_b_over_a(exps: &Exps) -> Result<Fp, ProgramError> {
 
 /// Stages, cumulative: 0 = hash_to_field, 1 = + both SSWU maps,
 /// 2 = + E' add + isogeny, 3 = full with cofactor clearing and validation.
-pub fn run(stage: u8, msg: &[u8]) -> Result<Vec<u8>, ProgramError> {
-    let u = hash_to_field(msg)?;
+pub fn run(dst: &[u8], stage: u8, msg: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    let u = hash_to_field(dst, msg)?;
     if stage == 0 {
         let mut out = Vec::with_capacity(96);
         out.extend_from_slice(&limbs_to_be(&u[0]));
@@ -586,146 +349,10 @@ pub fn run(stage: u8, msg: &[u8]) -> Result<Vec<u8>, ProgramError> {
 
 
 /// CIOS variant: single interleaved pass, less memory traffic than SOS.
-fn mont_mul_cios64(a: &Fp, b: &Fp) -> Fp {
-    let mut t = [0u64; 8];
-    for i in 0..6 {
-        let mut carry = 0u64;
-        for j in 0..6 {
-            let (lo, hi) = mac(t[j], a[i], b[j], carry);
-            t[j] = lo;
-            carry = hi;
-        }
-        let (t6, c7) = adc(t[6], carry, 0);
-        t[6] = t6;
-        t[7] = c7;
-
-        let m = t[0].wrapping_mul(INV);
-        let (_, mut carry) = mac(t[0], m, MODULUS[0], 0);
-        for j in 1..6 {
-            let (lo, hi) = mac(t[j], m, MODULUS[j], carry);
-            t[j - 1] = lo;
-            carry = hi;
-        }
-        let (t5, c) = adc(t[6], carry, 0);
-        t[5] = t5;
-        t[6] = t[7] + c;
-        t[7] = 0;
-    }
-    let mut r = [t[0], t[1], t[2], t[3], t[4], t[5]];
-    if t[6] != 0 || geq(&r, &MODULUS) {
-        r = sub_nocheck(&r, &MODULUS);
-    }
-    r
-}
-
-const INV32: u64 = INV & 0xffff_ffff;
-
-const fn split32(x: &Fp) -> [u64; 12] {
-    let mut out = [0u64; 12];
-    let mut i = 0;
-    while i < 6 {
-        out[i * 2] = x[i] & 0xffff_ffff;
-        out[i * 2 + 1] = x[i] >> 32;
-        i += 1;
-    }
-    out
-}
-
-// The modulus never changes, so its 32-bit lanes belong in a constant rather
-// than being rebuilt on every multiply.
-const P32: [u64; 12] = split32(&MODULUS);
-
-#[inline(always)]
-fn mac32(acc: u64, a: u64, b: u64, carry: u64) -> (u64, u64) {
-    let t = acc + a * b + carry;
-    (t & 0xffff_ffff, t >> 32)
-}
-
-/// CIOS with 32-bit limbs: the multiply-accumulate needs no wide arithmetic.
-#[inline(always)]
-fn mont_mul_cios32(a: &Fp, b: &Fp) -> Fp {
-    let a32 = split32(a);
-    let b32 = split32(b);
-
-    let mut t = [0u64; 14];
-    for i in 0..12 {
-        let ai = a32[i];
-        let mut carry = 0u64;
-        for j in 0..12 {
-            let (lo, hi) = mac32(t[j], ai, b32[j], carry);
-            t[j] = lo;
-            carry = hi;
-        }
-        let s = t[12] + carry;
-        t[12] = s & 0xffff_ffff;
-        t[13] = s >> 32;
-
-        let m = (t[0].wrapping_mul(INV32)) & 0xffff_ffff;
-        let (_, mut carry) = mac32(t[0], m, P32[0], 0);
-        for j in 1..12 {
-            let (lo, hi) = mac32(t[j], m, P32[j], carry);
-            t[j - 1] = lo;
-            carry = hi;
-        }
-        let s = t[12] + carry;
-        t[11] = s & 0xffff_ffff;
-        t[12] = t[13] + (s >> 32);
-        t[13] = 0;
-    }
-
-    let mut r = [0u64; 6];
-    for i in 0..6 {
-        r[i] = t[i * 2] | (t[i * 2 + 1] << 32);
-    }
-    if t[12] != 0 || geq(&r, &MODULUS) {
-        r = sub_nocheck(&r, &MODULUS);
-    }
-    r
-}
-
-pub fn mul_bench(variant: u8, count: u64) -> u64 {
-    let mul: fn(&Fp, &Fp) -> Fp = match variant {
-        0 => mont_mul,
-        1 => mont_mul_cios64,
-        _ => mont_mul_cios32,
-    };
-    let mut acc = R2;
-    let x = to_mont(&[3, 0, 0, 0, 0, 0]);
-    for _ in 0..count {
-        acc = mul(&core::hint::black_box(acc), &x);
-    }
-    acc[0]
-}
-
-pub fn mont_mul_bench(count: u64) -> u64 {
-    let mut acc = R2;
-    let x = to_mont(&[3, 0, 0, 0, 0, 0]);
-    for _ in 0..count {
-        acc = mont_mul(&core::hint::black_box(acc), &x);
-    }
-    acc[0]
-}
-
-// Witness-assisted variant: every result that big_mod_exp produced (inverses,
-// square roots, branch selection) arrives as instruction data and gets checked
-// with one or two multiplications. A wrong witness aborts; witnesses cannot
-// steer the output point, which stays a pure function of the message.
-
 const W_MAP: usize = 1 + 48 + 48;
 const W_TOTAL: usize = 2 * W_MAP + 3 * 48;
 
-use crate::g1_consts::SSWU_C1_NEG_B_OVER_A;
-
-pub(crate) fn wit48(bytes: &[u8]) -> Result<Fp, ProgramError> {
-    let arr: &[u8; 48] = bytes
-        .try_into()
-        .map_err(|_| ProgramError::InvalidInstructionData)?;
-    let limbs = be_to_limbs(arr);
-    if geq(&limbs, &MODULUS) {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    Ok(limbs)
-}
+use crate::consts_g1::SSWU_C1_NEG_B_OVER_A;
 
 struct FieldElem {
     canonical: Fp,
@@ -734,8 +361,8 @@ struct FieldElem {
 
 /// hash_to_field without modexp: split the 64-byte value at bit 256 and fold
 /// with a precomputed 2^256 mod p.
-fn hash_to_field_folded(msg: &[u8]) -> [FieldElem; 2] {
-    let blocks = expand_message_xmd(msg);
+fn hash_to_field_folded(dst: &[u8], msg: &[u8]) -> [FieldElem; 2] {
+    let blocks = expand_message_xmd(dst, msg);
     let mut out = [
         FieldElem { canonical: [0; 6], mont: [0; 6] },
         FieldElem { canonical: [0; 6], mont: [0; 6] },
@@ -850,21 +477,20 @@ fn iso_map_witnessed(
 }
 
 
-const DST_G1_NU: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_NU_POP_";
 
 /// Single-element hash_to_field for the NU (encode_to_curve) suite.
-fn hash_to_field_nu(msg: &[u8]) -> FieldElem {
-    use solana_program::hash::hashv;
+fn hash_to_field_nu(dst: &[u8], msg: &[u8]) -> FieldElem {
+    use solana_sha256_hasher::hashv;
     let z_pad = [0u8; 64];
     let l_i_b = [0u8, 64];
-    let dst_len = [DST_G1_NU.len() as u8];
-    let b0 = hashv(&[&z_pad, msg, &l_i_b, &[0u8], DST_G1_NU, &dst_len]).to_bytes();
-    let b1 = hashv(&[&b0, &[1u8], DST_G1_NU, &dst_len]).to_bytes();
+    let dst_len = [dst.len() as u8];
+    let b0 = hashv(&[&z_pad, msg, &l_i_b, &[0u8], dst, &dst_len]).to_bytes();
+    let b1 = hashv(&[&b0, &[1u8], dst, &dst_len]).to_bytes();
     let mut x = [0u8; 32];
     for j in 0..32 {
         x[j] = b0[j] ^ b1[j];
     }
-    let b2 = hashv(&[&x, &[2u8], DST_G1_NU, &dst_len]).to_bytes();
+    let b2 = hashv(&[&x, &[2u8], dst, &dst_len]).to_bytes();
 
     let mut hi = [0u8; 48];
     let mut lo = [0u8; 48];
@@ -877,16 +503,13 @@ fn hash_to_field_nu(msg: &[u8]) -> FieldElem {
 
 /// Witnessed encode_to_curve (RFC 9380 NU): one map, no addition.
 /// Blob: flag, w_inv, y, w_xd, w_yd then the message.
-pub fn run_witnessed_nu(payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
+pub fn encode_to_g1(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
     const NU_TOTAL: usize = W_MAP + 2 * 48;
-    if payload.len() < NU_TOTAL {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let (wits, msg) = payload.split_at(NU_TOTAL);
+    let (wits, msg) = split_witness(payload, NU_TOTAL)?;
     let w_xd = wit48(&wits[W_MAP..W_MAP + 48])?;
     let w_yd = wit48(&wits[W_MAP + 48..])?;
 
-    let u = hash_to_field_nu(msg);
+    let u = hash_to_field_nu(dst, msg);
     let p = map_to_curve_witnessed(&u, &wits[..W_MAP])?;
     let (x, y) = iso_map_witnessed(&p, &w_xd, &w_yd)?;
     let cleared = clear_cofactor(&point_bytes(&x, &y))?;
@@ -894,13 +517,10 @@ pub fn run_witnessed_nu(payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
     Ok(cleared.to_vec())
 }
 
-pub fn run_witnessed(payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
-    if payload.len() < W_TOTAL {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let (wits, msg) = payload.split_at(W_TOTAL);
+pub fn hash_to_g1(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    let (wits, msg) = split_witness(payload, W_TOTAL)?;
 
-    let u = hash_to_field_folded(msg);
+    let u = hash_to_field_folded(dst, msg);
     let p0 = map_to_curve_witnessed(&u[0], &wits[..W_MAP])?;
     let p1 = map_to_curve_witnessed(&u[1], &wits[W_MAP..2 * W_MAP])?;
 
@@ -956,8 +576,18 @@ pub mod witness {
         limbs_to_be(&pow_mont(v_m, &exp_inverse()))
     }
 
+    // The other square root of gx: an equally valid witness that the sign
+    // correction must resolve to the same output point.
+    pub fn flip_first_sqrt(blob: &[u8]) -> Vec<u8> {
+        let y = wit48(&blob[49..97]).unwrap();
+        let mut out = blob[..49].to_vec();
+        out.extend_from_slice(&limbs_to_be(&neg_mod(&y)));
+        out.extend_from_slice(&blob[97..]);
+        out
+    }
+
     pub fn generate_nu(msg: &[u8]) -> Vec<u8> {
-        let elem = hash_to_field_nu(msg);
+        let elem = hash_to_field_nu(crate::dst::G1_NU, msg);
         let (blob_map, point) = map_blob(&elem);
         let mut blob = blob_map;
         let x_den = horner(&ISO11_XDEN, &point.x);
@@ -999,7 +629,7 @@ pub mod witness {
     }
 
     pub fn generate(msg: &[u8]) -> Vec<u8> {
-        let u = hash_to_field_folded(msg);
+        let u = hash_to_field_folded(crate::dst::G1_RO, msg);
         let mut blob = Vec::with_capacity(W_TOTAL);
         let mut points = Vec::new();
 

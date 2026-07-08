@@ -1,0 +1,26 @@
+[package]
+name = "bls381-hash"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Witness-assisted RFC 9380 hash-to-curve for BLS12-381 on Solana SBF"
+
+[lib]
+name = "bls381_hash"
+
+[dependencies]
+solana-program-error = "3.0.1"
+solana-sha256-hasher = "3.1.0"
+solana-define-syscall = "4.0.1"
+
+[features]
+default = ["ro"]
+ro = ["g1-ro", "g2-ro"]
+g1-ro = []
+g2-ro = []
+g1-nu = []
+g2-nu = []
+g1-svdw = []
+g2-svdw = []
+modexp = []
+full = ["g1-ro", "g2-ro", "g1-nu", "g2-nu", "g1-svdw", "g2-svdw", "modexp"]
