@@ -1,7 +1,7 @@
 # bls381-hash
 
 Witness-assisted RFC 9380 hash-to-curve for BLS12-381, for Solana SBF programs.
-`no_std`, allocation-free on-chain, using only syscalls active on mainnet today —
+`no_std`, allocation-free on-chain, using only syscalls active on mainnet today,
 no `big_mod_exp` (SIMD-0529) and no map-to-curve syscall. Everything expensive
 (inverses, Legendre symbols, square roots) rides in as witness data and is
 verified with a multiplication or two. Host-side witness generation ships in the
