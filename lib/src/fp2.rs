@@ -4,7 +4,7 @@ use solana_program_error::ProgramError;
 
 use crate::consts_g1::R;
 use crate::fp::{
-    add_mod, from_mont, is_zero, mont_mul, neg_mod, sub_mod, to_mont, wit48, Fp,
+    add_mod, add_unreduced, from_mont, is_zero, mont_mul, neg_mod, sub_mod, to_mont, wit48, Fp,
 };
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -24,6 +24,15 @@ pub(crate) fn add2(a: &Fp2, b: &Fp2) -> Fp2 {
     Fp2 { c0: add_mod(&a.c0, &b.c0), c1: add_mod(&a.c1, &b.c1) }
 }
 
+/// Component sums without the reduction; only for mul2 operands (each
+/// component stays below a few p, well under the 2^384 operand bound)
+pub(crate) fn add2_unreduced(a: &Fp2, b: &Fp2) -> Fp2 {
+    Fp2 {
+        c0: add_unreduced(&a.c0, &b.c0),
+        c1: add_unreduced(&a.c1, &b.c1),
+    }
+}
+
 pub(crate) fn sub2(a: &Fp2, b: &Fp2) -> Fp2 {
     Fp2 { c0: sub_mod(&a.c0, &b.c0), c1: sub_mod(&a.c1, &b.c1) }
 }
@@ -37,13 +46,14 @@ pub(crate) fn is_zero2(a: &Fp2) -> bool {
 }
 
 /// Karatsuba: works whenever the component products are valid mont_mul calls,
-/// so also for canonical-times-Montgomery mixed-domain multiplication.
+/// so also for canonical times Montgomery mixed domain multiplication.
 #[inline(always)]
 pub(crate) fn mul2(a: &Fp2, b: &Fp2) -> Fp2 {
     let t0 = mont_mul(&a.c0, &b.c0);
     let t1 = mont_mul(&a.c1, &b.c1);
-    let sa = add_mod(&a.c0, &a.c1);
-    let sb = add_mod(&b.c0, &b.c1);
+    // the Karatsuba sums feed mont_mul unreduced; see add_unreduced
+    let sa = add_unreduced(&a.c0, &a.c1);
+    let sb = add_unreduced(&b.c0, &b.c1);
     let t2 = mont_mul(&sa, &sb);
     Fp2 {
         c0: sub_mod(&t0, &t1),
@@ -54,7 +64,7 @@ pub(crate) fn mul2(a: &Fp2, b: &Fp2) -> Fp2 {
 
 #[inline(always)]
 pub(crate) fn sq2(a: &Fp2) -> Fp2 {
-    let s = add_mod(&a.c0, &a.c1);
+    let s = add_unreduced(&a.c0, &a.c1);
     let d = sub_mod(&a.c0, &a.c1);
     let t = mont_mul(&a.c0, &a.c1);
     Fp2 {

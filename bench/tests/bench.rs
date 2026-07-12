@@ -257,6 +257,98 @@ fn bench_u128_mac_loop() {
     );
 }
 
+// Per function CU costs, svm-unit-test style: each probe id runs one
+// function in a loop-carried loop, so the number is that function alone.
+#[test]
+fn bench_function_costs() {
+    let mollusk = mollusk();
+    let probes: &[(u8, &str, u64)] = &[
+        (0, "mont_mul", 20_000),
+        (1, "mont_sqr", 20_000),
+        (2, "from_mont (redc)", 20_000),
+        (3, "to_mont", 20_000),
+        (4, "add_mod", 100_000),
+        (5, "sub_mod", 100_000),
+        (6, "neg_mod", 100_000),
+        (7, "mul2", 10_000),
+        (8, "sq2", 10_000),
+        (9, "add2", 50_000),
+        (10, "sub2", 50_000),
+        (11, "mul_by_xi2", 50_000),
+        (12, "mul_by_a2i", 50_000),
+        (13, "from_mont2", 10_000),
+        (14, "to_mont2", 10_000),
+        (15, "iso11_adapted", 1_000),
+        (16, "iso3_adapted", 1_000),
+        (17, "gx_at", 5_000),
+        (18, "gx2_at", 2_000),
+        (19, "mul_by_xi", 50_000),
+        (20, "wit48 parse", 50_000),
+        (21, "wit96 parse", 20_000),
+        (22, "be/le round trip", 50_000),
+        (23, "expand_message_xmd g1", 100),
+        (24, "expand_message_xmd g2", 100),
+    ];
+    println!("per function CU:");
+    for &(id, name, n) in probes {
+        let mut payload = vec![id];
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let base = run(&mollusk, 24, &payload);
+        let mut payload = vec![id];
+        payload.extend_from_slice(&n.to_le_bytes());
+        let looped = run(&mollusk, 24, &payload);
+        assert!(!looped.program_result.is_err(), "{name} probe failed");
+        let per_op =
+            (looped.compute_units_consumed - base.compute_units_consumed) as f64 / n as f64;
+        println!("  {name:<22} {per_op:>10.1}");
+    }
+}
+
+#[test]
+fn bench_field_primitives() {
+    let mollusk = mollusk();
+    for (tag, name, n) in [(22u8, "mont_mul", 20_000u64), (23, "mul2", 10_000)] {
+        let base = run(&mollusk, tag, &0u64.to_le_bytes());
+        let looped = run(&mollusk, tag, &n.to_le_bytes());
+        assert!(!base.program_result.is_err());
+        assert!(!looped.program_result.is_err());
+        let per_op =
+            (looped.compute_units_consumed - base.compute_units_consumed) as f64 / n as f64;
+        println!("{name}: per_op={per_op:.1} CU");
+    }
+}
+
+// Stage by stage CU for the witnessed min-sig and min-pk pipelines.
+#[test]
+fn bench_witness_stage_breakdown() {
+    let mollusk = mollusk();
+    let names = ["hash_to_field", "sswu maps", "add + iso", "clear + validate"];
+
+    for (tag, label, witness) in [
+        (46u8, "min-sig G1", bls381_hash::witness::g1::generate(MESSAGE)),
+        (47, "min-pk G2", bls381_hash::witness::g2::generate(MESSAGE)),
+    ] {
+        let mut cumulative = [0u64; 4];
+        for stage in 0..4u8 {
+            let mut payload = vec![stage];
+            payload.extend_from_slice(&witness);
+            payload.extend_from_slice(MESSAGE);
+            let r = run(&mollusk, tag, &payload);
+            assert!(!r.program_result.is_err(), "{label} stage {stage} failed");
+            cumulative[stage as usize] = r.compute_units_consumed;
+        }
+        println!("witnessed {label} stages:");
+        for (i, name) in names.iter().enumerate() {
+            let delta = if i == 0 {
+                cumulative[0]
+            } else {
+                cumulative[i] - cumulative[i - 1]
+            };
+            println!("  {name:<18} {delta:>7} CU (cumulative {})", cumulative[i]);
+        }
+    }
+}
+
 #[test]
 fn bench_syscall_assisted_hash_to_g1() {
     use bls12_381::hash_to_curve::{HashToField, MapToCurve};
@@ -364,70 +456,6 @@ fn bench_witness_hash_to_g1() {
     let mut bad = payload.clone();
     bad[60] ^= 1;
     let rejected = run(&mollusk, 40, &bad);
-    assert!(rejected.program_result.is_err(), "corrupt witness was accepted");
-}
-
-#[test]
-fn bench_witness_svdw_hash_to_g1() {
-    let mollusk = mollusk();
-
-    let witnesses = bls381_hash::witness::g1_svdw::generate(MESSAGE);
-    let mut payload = witnesses.clone();
-    payload.extend_from_slice(MESSAGE);
-
-    let result = run(&mollusk, 42, &payload);
-    assert!(
-        !result.program_result.is_err(),
-        "witnessed svdw hash_to_g1 failed: {:?}",
-        result.program_result
-    );
-
-    // Reference: host-side pre-clearing sum, effective cofactor applied
-    // through zkcrypto scalar multiplication.
-    let pre = bls381_hash::witness::g1_svdw::reference_preclear(MESSAGE);
-    let aff = Option::<G1Affine>::from(G1Affine::from_uncompressed_unchecked(&pre))
-        .expect("reference point parses");
-    let expected = G1Affine::from(G1Projective::from(aff) * Scalar::from(0xd201000000010001u64))
-        .to_uncompressed();
-    assert_eq!(result.return_data, expected.to_vec(), "differs from host reference");
-
-    // Different map, different suite: must NOT match the SSWU hash.
-    let mut point = blst::blst_p1::default();
-    let mut sswu = [0u8; 96];
-    unsafe {
-        blst::blst_hash_to_g1(
-            &mut point,
-            MESSAGE.as_ptr(),
-            MESSAGE.len(),
-            DST_G1.as_ptr(),
-            DST_G1.len(),
-            std::ptr::null(),
-            0,
-        );
-        blst::blst_p1_serialize(sswu.as_mut_ptr(), &point);
-    }
-    assert_ne!(result.return_data, sswu.to_vec(), "svdw output cannot equal the sswu suite");
-
-    println!(
-        "witness-assisted SvdW hash_to_G1: {} CU ({} witness bytes)",
-        result.compute_units_consumed,
-        witnesses.len()
-    );
-
-    // the other square root is an equally valid witness and must not
-    // steer the output
-    let flipped = bls381_hash::witness::g1_svdw::flip_first_sqrt(&witnesses);
-    let mut alt = flipped;
-    alt.extend_from_slice(MESSAGE);
-    let same = run(&mollusk, 42, &alt);
-    assert!(!same.program_result.is_err(), "flipped root rejected");
-    assert_eq!(same.return_data, result.return_data, "flipped root changed the point");
-
-    // corrupted witness must abort, not produce a different point
-    let mut bad = payload.clone();
-    let dx_last = witnesses.len() - 1;
-    bad[dx_last] ^= 1;
-    let rejected = run(&mollusk, 42, &bad);
     assert!(rejected.program_result.is_err(), "corrupt witness was accepted");
 }
 
@@ -572,71 +600,6 @@ fn witness_g1_soundness() {
 }
 
 #[test]
-fn bench_witness_svdw_hash_to_g2() {
-    use bls12_381::hash_to_curve::MapToCurve;
-
-    let mollusk = mollusk();
-
-    let witnesses = bls381_hash::witness::g2_svdw::generate(MESSAGE);
-    let mut payload = witnesses.clone();
-    payload.extend_from_slice(MESSAGE);
-
-    let result = run(&mollusk, 43, &payload);
-    assert!(
-        !result.program_result.is_err(),
-        "witnessed svdw hash_to_g2 failed: {:?}",
-        result.program_result
-    );
-
-    // Reference: host-side pre-clearing sum, cofactor cleared through
-    // zkcrypto's clear_h (same Budroni-Pintore construction).
-    let pre = bls381_hash::witness::g2_svdw::reference_preclear(MESSAGE);
-    let aff = Option::<G2Affine>::from(G2Affine::from_uncompressed_unchecked(&pre))
-        .expect("reference point parses");
-    let expected = G2Affine::from(G2Projective::from(aff).clear_h()).to_uncompressed();
-    assert_eq!(result.return_data, expected.to_vec(), "differs from host reference");
-
-    // Different map, different suite: must NOT match the SSWU hash.
-    let mut point = blst::blst_p2::default();
-    let mut sswu = [0u8; 192];
-    unsafe {
-        blst::blst_hash_to_g2(
-            &mut point,
-            MESSAGE.as_ptr(),
-            MESSAGE.len(),
-            DST_G2.as_ptr(),
-            DST_G2.len(),
-            std::ptr::null(),
-            0,
-        );
-        blst::blst_p2_serialize(sswu.as_mut_ptr(), &point);
-    }
-    assert_ne!(result.return_data, sswu.to_vec(), "svdw output cannot equal the sswu suite");
-
-    println!(
-        "witness-assisted SvdW hash_to_G2: {} CU ({} witness bytes)",
-        result.compute_units_consumed,
-        witnesses.len()
-    );
-
-    // the other square root is an equally valid witness and must not
-    // steer the output
-    let flipped = bls381_hash::witness::g2_svdw::flip_first_sqrt(&witnesses);
-    let mut alt = flipped;
-    alt.extend_from_slice(MESSAGE);
-    let same = run(&mollusk, 43, &alt);
-    assert!(!same.program_result.is_err(), "flipped root rejected");
-    assert_eq!(same.return_data, result.return_data, "flipped root changed the point");
-
-    // corrupted witness must abort, not produce a different point
-    let mut bad = payload.clone();
-    let dx_last = witnesses.len() - 1;
-    bad[dx_last] ^= 1;
-    let rejected = run(&mollusk, 43, &bad);
-    assert!(rejected.program_result.is_err(), "corrupt witness was accepted");
-}
-
-#[test]
 fn bench_witness_nu_encode() {
     let mollusk = mollusk();
     const DST_G1_NU: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_NU_POP_";
@@ -713,7 +676,6 @@ fn bench_min_pk_verify_end_to_end() {
 
         let mut payload = vec![(20 - k) as u8];
         payload.extend_from_slice(&agg_all.serialize());
-        payload.extend_from_slice(&G1Affine::generator().to_uncompressed());
         payload.extend_from_slice(&agg_sig.compress());
         for pk in &pks[k..] {
             payload.extend_from_slice(&pk.compress());
@@ -734,7 +696,7 @@ fn bench_min_pk_verify_end_to_end() {
 
         // tampered signature must fail
         let mut bad = payload.clone();
-        bad[1 + 96 + 96 + 10] ^= 1;
+        bad[1 + 96 + 10] ^= 1;
         let rejected = run(&mollusk, 51, &bad);
         assert!(rejected.program_result.is_err(), "forged min-pk verify accepted at k={k}");
     }

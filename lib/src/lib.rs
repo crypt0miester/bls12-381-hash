@@ -7,17 +7,15 @@
 #![allow(dead_code)]
 #![allow(unexpected_cfgs)]
 
-#[macro_use]
 extern crate alloc;
 
 mod consts_g1;
 mod consts_g2;
 mod fp;
+mod macros;
 mod fp2;
 mod g1;
 mod g2;
-mod g1_svdw;
-mod g2_svdw;
 
 use solana_program_error::ProgramError;
 
@@ -47,22 +45,26 @@ pub mod dst {
 pub use crate::g1::hash_to_g1;
 #[cfg(feature = "g2-ro")]
 pub use crate::g2::hash_to_g2;
+#[doc(hidden)]
+#[cfg(feature = "g1-ro")]
+pub use crate::g1::hash_to_g1_prefix;
+#[doc(hidden)]
+#[cfg(feature = "g2-ro")]
+pub use crate::g2::hash_to_g2_prefix;
 #[cfg(feature = "g1-nu")]
 pub use crate::g1::encode_to_g1;
 #[cfg(feature = "g2-nu")]
 pub use crate::g2::encode_to_g2;
-#[cfg(feature = "g1-svdw")]
-pub use crate::g1_svdw::run_witnessed as hash_to_g1_svdw;
-#[cfg(feature = "g2-svdw")]
-pub use crate::g2_svdw::run_witnessed as hash_to_g2_svdw;
 #[cfg(feature = "modexp")]
 pub use crate::g1::run as hash_to_g1_modexp;
+
+/// Per function CU probes for the bench harness; not part of the API
+#[doc(hidden)]
+pub mod probe;
 
 /// Host-side witness generation, one module per suite.
 #[cfg(not(target_os = "solana"))]
 pub mod witness {
     pub use crate::g1::witness as g1;
-    pub use crate::g1_svdw::witness as g1_svdw;
     pub use crate::g2::witness as g2;
-    pub use crate::g2_svdw::witness as g2_svdw;
 }

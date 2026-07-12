@@ -11,15 +11,15 @@ use solana_program_error::ProgramError;
 use alloc::vec::Vec;
 
 use crate::consts_g1::{
-    ISO11A_XDEN, ISO11A_XNUM, ISO11A_YDEN, ISO11A_YNUM, ISO11_XDEN, ISO11_XNUM, ISO11_YDEN,
-    ISO11_YNUM, R, R2, SSWU_ELLP_A, SSWU_ELLP_B,
+    ISO11A_XDEN, ISO11A_XNUM, ISO11A_YDEN, ISO11A_YNUM, MODULUS, R, SSWU_ELLP_A, SSWU_ELLP_B,
 };
 use crate::consts_g2::C256_MONT;
 use crate::fp::*;
+use crate::macros::stage;
 
 const H_EFF: u64 = 0xd201000000010001;
 
-fn expand_message_xmd(dst: &[u8], msg: &[u8]) -> [[u8; 32]; 4] {
+pub(crate) fn expand_message_xmd(dst: &[u8], msg: &[u8]) -> [[u8; 32]; 4] {
     use solana_sha256_hasher::hashv;
 
     let z_pad = [0u8; 64];
@@ -84,7 +84,7 @@ fn is_one_canonical(a: &Fp) -> bool {
 }
 
 /// xi = 11: multiply by the SSWU non-residue with an addition chain.
-fn mul_by_xi(a: &Fp) -> Fp {
+pub(crate) fn mul_by_xi(a: &Fp) -> Fp {
     let a2 = add_mod(a, a);
     let a4 = add_mod(&a2, &a2);
     let a8 = add_mod(&a4, &a4);
@@ -159,82 +159,48 @@ fn add_prime(p: &PointPrime, q: &PointPrime, exps: &Exps) -> Result<PointPrime, 
 /// Evaluate the four iso-11 polynomials with Knuth-adapted constants:
 /// 27 multiplications against 51 for shared-nothing Horner. 
 pub(crate) fn iso11_adapted(x: &Fp) -> (Fp, Fp, Fp, Fp) {
-    let w = mont_mul(x, x);
-    let mut xnum = add_mod(
-        &mont_mul(&add_mod(x, &ISO11A_XNUM[0]), &add_mod(&w, &ISO11A_XNUM[1])),
+    let w = mont_sqr(x);
+    let mut xnum = add_unreduced(
+        &mont_mul(&add_unreduced(x, &ISO11A_XNUM[0]), &add_unreduced(&w, &ISO11A_XNUM[1])),
         &ISO11A_XNUM[2],
     );
-    let t = add_mod(&w, &ISO11A_XNUM[3]);
-    xnum = add_mod(&mont_mul(&xnum, &t), &ISO11A_XNUM[4]);
-    let mut t = add_mod(&w, &ISO11A_XNUM[5]);
-    t = add_mod(&t, x);
-    xnum = add_mod(&mont_mul(&xnum, &t), &ISO11A_XNUM[6]);
-    let mut t = add_mod(&w, &ISO11A_XNUM[7]);
-    t = add_mod(&t, x);
-    t = add_mod(&t, x);
-    t = add_mod(&t, x);
-    xnum = add_mod(&mont_mul(&xnum, &t), &ISO11A_XNUM[8]);
-    let t = add_mod(&w, &ISO11A_XNUM[9]);
-    xnum = add_mod(&mont_mul(&xnum, &t), &ISO11A_XNUM[10]);
+    stage!(xnum, w + ISO11A_XNUM[3]; ISO11A_XNUM[4]);
+    stage!(xnum, w + ISO11A_XNUM[5], x; ISO11A_XNUM[6]);
+    stage!(xnum, w + ISO11A_XNUM[7], x, x, x; ISO11A_XNUM[8]);
+    stage!(xnum, w + ISO11A_XNUM[9]; ISO11A_XNUM[10]);
     let xnum = mont_mul(&xnum, &ISO11A_XNUM[11]);
 
-    let t = add_mod(&add_mod(&w, &mont_mul(&ISO11A_XDEN[0], x)), &ISO11A_XDEN[1]);
-    let mut xden = add_mod(&mont_mul(&t, &add_mod(&w, &ISO11A_XDEN[2])), &ISO11A_XDEN[3]);
-    let mut t = add_mod(&w, &ISO11A_XDEN[4]);
-    t = add_mod(&t, x);
-    t = add_mod(&t, x);
-    xden = add_mod(&mont_mul(&xden, &t), &ISO11A_XDEN[5]);
-    let mut t = add_mod(&w, &ISO11A_XDEN[6]);
-    t = add_mod(&t, x);
-    xden = add_mod(&mont_mul(&xden, &t), &ISO11A_XDEN[7]);
-    let mut t = add_mod(&w, &ISO11A_XDEN[8]);
-    t = add_mod(&t, x);
-    t = add_mod(&t, x);
-    xden = add_mod(&mont_mul(&xden, &t), &ISO11A_XDEN[9]);
+    let t = add_unreduced(&add_unreduced(&w, &mont_mul(&ISO11A_XDEN[0], x)), &ISO11A_XDEN[1]);
+    let mut xden = add_unreduced(&mont_mul(&t, &add_unreduced(&w, &ISO11A_XDEN[2])), &ISO11A_XDEN[3]);
+    stage!(xden, w + ISO11A_XDEN[4], x, x; ISO11A_XDEN[5]);
+    stage!(xden, w + ISO11A_XDEN[6], x; ISO11A_XDEN[7]);
+    stage!(xden, w + ISO11A_XDEN[8], x, x; ISO11A_XDEN[9]);
 
-    let mut ynum = add_mod(
-        &mont_mul(&add_mod(x, &ISO11A_YNUM[0]), &add_mod(&w, &ISO11A_YNUM[1])),
+    let mut ynum = add_unreduced(
+        &mont_mul(&add_unreduced(x, &ISO11A_YNUM[0]), &add_unreduced(&w, &ISO11A_YNUM[1])),
         &ISO11A_YNUM[2],
     );
-    let mut t = add_mod(&w, &ISO11A_YNUM[3]);
-    t = add_mod(&t, x);
-    ynum = add_mod(&mont_mul(&ynum, &t), &ISO11A_YNUM[4]);
-    let t = add_mod(&w, &ISO11A_YNUM[5]);
-    ynum = add_mod(&mont_mul(&ynum, &t), &ISO11A_YNUM[6]);
-    let mut t = add_mod(&w, &ISO11A_YNUM[7]);
-    t = add_mod(&t, x);
-    ynum = add_mod(&mont_mul(&ynum, &t), &ISO11A_YNUM[8]);
-    let t = add_mod(&w, &ISO11A_YNUM[9]);
-    ynum = add_mod(&mont_mul(&ynum, &t), &ISO11A_YNUM[10]);
-    let mut t = add_mod(&w, &ISO11A_YNUM[11]);
-    t = add_mod(&t, x);
-    t = add_mod(&t, x);
-    ynum = add_mod(&mont_mul(&ynum, &t), &ISO11A_YNUM[12]);
-    let t = add_mod(&w, &ISO11A_YNUM[13]);
-    ynum = add_mod(&mont_mul(&ynum, &t), &ISO11A_YNUM[14]);
+    stage!(ynum, w + ISO11A_YNUM[3], x; ISO11A_YNUM[4]);
+    stage!(ynum, w + ISO11A_YNUM[5]; ISO11A_YNUM[6]);
+    stage!(ynum, w + ISO11A_YNUM[7], x; ISO11A_YNUM[8]);
+    stage!(ynum, w + ISO11A_YNUM[9]; ISO11A_YNUM[10]);
+    stage!(ynum, w + ISO11A_YNUM[11], x, x; ISO11A_YNUM[12]);
+    stage!(ynum, w + ISO11A_YNUM[13]; ISO11A_YNUM[14]);
     let ynum = mont_mul(&ynum, &ISO11A_YNUM[15]);
 
-    let mut yden = add_mod(
-        &mont_mul(&add_mod(x, &ISO11A_YDEN[0]), &add_mod(&w, &ISO11A_YDEN[1])),
+    let mut yden = add_unreduced(
+        &mont_mul(&add_unreduced(x, &ISO11A_YDEN[0]), &add_unreduced(&w, &ISO11A_YDEN[1])),
         &ISO11A_YDEN[2],
     );
-    let mut t = add_mod(&w, &ISO11A_YDEN[3]);
-    t = add_mod(&t, x);
-    yden = add_mod(&mont_mul(&yden, &t), &ISO11A_YDEN[4]);
-    let mut t = add_mod(&w, &ISO11A_YDEN[5]);
-    t = add_mod(&t, x);
-    t = add_mod(&t, x);
-    yden = add_mod(&mont_mul(&yden, &t), &ISO11A_YDEN[6]);
-    let t = add_mod(&w, &ISO11A_YDEN[7]);
-    yden = add_mod(&mont_mul(&yden, &t), &ISO11A_YDEN[8]);
-    let mut t = add_mod(&w, &ISO11A_YDEN[9]);
-    t = add_mod(&t, x);
-    yden = add_mod(&mont_mul(&yden, &t), &ISO11A_YDEN[10]);
-    let t = add_mod(&w, &ISO11A_YDEN[11]);
-    yden = add_mod(&mont_mul(&yden, &t), &ISO11A_YDEN[12]);
-    let t = add_mod(&w, &ISO11A_YDEN[13]);
-    yden = add_mod(&mont_mul(&yden, &t), &ISO11A_YDEN[14]);
+    stage!(yden, w + ISO11A_YDEN[3], x; ISO11A_YDEN[4]);
+    stage!(yden, w + ISO11A_YDEN[5], x, x; ISO11A_YDEN[6]);
+    stage!(yden, w + ISO11A_YDEN[7]; ISO11A_YDEN[8]);
+    stage!(yden, w + ISO11A_YDEN[9], x; ISO11A_YDEN[10]);
+    stage!(yden, w + ISO11A_YDEN[11]; ISO11A_YDEN[12]);
+    stage!(yden, w + ISO11A_YDEN[13]; ISO11A_YDEN[14]);
 
+    let xden = if geq(&xden, &MODULUS) { sub_nocheck(&xden, &MODULUS) } else { xden };
+    let yden = if geq(&yden, &MODULUS) { sub_nocheck(&yden, &MODULUS) } else { yden };
     (xnum, xden, ynum, yden)
 }
 
@@ -266,20 +232,23 @@ const BLS12_381_G1_BE: u64 = 5 | 0x80;
 const OP_ADD: u64 = 0;
 
 fn g1_add(a: &[u8; 96], b: &[u8; 96]) -> Result<[u8; 96], ProgramError> {
-    let mut out = [0u8; 96];
+    // The syscall fills the whole point on success, so skip the zero-init;
+    // the pointer escapes and LLVM cannot drop the memset on its own.
+    let mut out = core::mem::MaybeUninit::<[u8; 96]>::uninit();
     let rc = unsafe {
         sys::sol_curve_group_op(
             BLS12_381_G1_BE,
             OP_ADD,
             a.as_ptr(),
             b.as_ptr(),
-            out.as_mut_ptr(),
+            out.as_mut_ptr() as *mut u8,
         )
     };
     if rc != 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
-    Ok(out)
+    // SAFETY: rc == 0 means the syscall wrote all 96 bytes
+    Ok(unsafe { out.assume_init() })
 }
 
 /// Multiplies by the effective cofactor with double-and-add over the g1 add
@@ -352,6 +321,9 @@ pub fn run(dst: &[u8], stage: u8, msg: &[u8]) -> Result<Vec<u8>, ProgramError> {
 const W_MAP: usize = 1 + 48 + 48;
 const W_TOTAL: usize = 2 * W_MAP + 3 * 48;
 
+// Compile time layout guard: the parse offsets assume this blob shape.
+const _: () = assert!(W_MAP == 97 && W_TOTAL == 338);
+
 use crate::consts_g1::SSWU_C1_NEG_B_OVER_A;
 
 struct FieldElem {
@@ -381,7 +353,7 @@ fn hash_to_field_folded(dst: &[u8], msg: &[u8]) -> [FieldElem; 2] {
     out
 }
 
-fn gx_at(x: &Fp) -> Fp {
+pub(crate) fn gx_at(x: &Fp) -> Fp {
     let xsq = mont_sqr(x);
     let x3 = mont_mul(&xsq, x);
     add_mod(&add_mod(&x3, &mont_mul(&SSWU_ELLP_A, x)), &SSWU_ELLP_B)
@@ -429,51 +401,64 @@ fn map_to_curve_witnessed(u: &FieldElem, wit: &[u8]) -> Result<PointPrime, Progr
         return Err(ProgramError::InvalidInstructionData);
     }
 
-    let yw_m = to_mont(&y_w);
-    if mont_sqr(&yw_m) != gx {
+    // The sqrt witness arrives in Montgomery form (a redc to read its sign
+    // is cheaper than a to_mont to square-check it); negation commutes with
+    // the Montgomery map, so the sign fix applies to the form we keep.
+    let y_c = from_mont(&y_w);
+    if mont_sqr(&y_w) != gx {
         return Err(ProgramError::InvalidInstructionData);
     }
-
-    // Negation commutes with the Montgomery map, so flip the square root we
-    // already converted rather than converting the canonical value a second time.
-    let y = if (y_w[0] & 1) != (u.canonical[0] & 1) {
-        neg_mod(&yw_m)
+    let y = if (y_c[0] & 1) != (u.canonical[0] & 1) {
+        neg_mod(&y_w)
     } else {
-        yw_m
+        y_w
     };
 
     Ok(PointPrime { x, y })
 }
 
+/// The slope itself is witnessed (not 1/dx): lambda * dx == dy pins it with
+/// one multiply, and dx != 0 makes it unique.
 fn add_prime_witnessed(
     p: &PointPrime,
     q: &PointPrime,
-    w_dx: &Fp,
+    w_lambda: &Fp,
 ) -> Result<PointPrime, ProgramError> {
     if p.x == q.x {
         return Err(ProgramError::InvalidInstructionData);
     }
     let dx = sub_mod(&q.x, &p.x);
-    let inv_m = check_inverse(&dx, w_dx)?;
-    let lambda = mont_mul(&sub_mod(&q.y, &p.y), &inv_m);
-    let x3 = sub_mod(&sub_mod(&mont_sqr(&lambda), &p.x), &q.x);
-    let y3 = sub_mod(&mont_mul(&lambda, &sub_mod(&p.x, &x3)), &p.y);
+    let dy = sub_mod(&q.y, &p.y);
+    if mont_mul(w_lambda, &dx) != dy {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let x3 = sub_mod(&sub_mod(&mont_sqr(w_lambda), &p.x), &q.x);
+    let y3 = sub_mod(&mont_mul(w_lambda, &sub_mod(&p.x, &x3)), &p.y);
     Ok(PointPrime { x: x3, y: y3 })
 }
 
+/// The output coordinates are witnessed (Montgomery form) instead of the
+/// denominator inverses: x * x_den == x_num pins x with one multiply per
+/// coordinate. The RFC 9380 iso-11 numerators and denominators are coprime,
+/// so both vanishing at once is impossible; a zero denominator (point maps
+/// to infinity) is rejected as before.
 fn iso_map_witnessed(
     p: &PointPrime,
-    w_xd: &Fp,
-    w_yd: &Fp,
+    w_x: &Fp,
+    w_y: &Fp,
 ) -> Result<([u8; 48], [u8; 48]), ProgramError> {
     let (x_num, x_den, y_num, y_den) = iso11_adapted(&p.x);
 
-    let xd_inv = check_inverse(&x_den, w_xd)?;
-    let yd_inv = check_inverse(&y_den, w_yd)?;
-
-    let x = mont_mul(&x_num, &xd_inv);
-    let y = mont_mul(&p.y, &mont_mul(&y_num, &yd_inv));
-    Ok((limbs_to_be(&from_mont(&x)), limbs_to_be(&from_mont(&y))))
+    if is_zero(&x_den) || is_zero(&y_den) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if mont_mul(w_x, &x_den) != x_num {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if mont_mul(w_y, &y_den) != mont_mul(&y_num, &p.y) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok((limbs_to_be(&from_mont(w_x)), limbs_to_be(&from_mont(w_y))))
 }
 
 
@@ -502,35 +487,52 @@ fn hash_to_field_nu(dst: &[u8], msg: &[u8]) -> FieldElem {
 }
 
 /// Witnessed encode_to_curve (RFC 9380 NU): one map, no addition.
-/// Blob: flag, w_inv, y, w_xd, w_yd then the message.
+/// Blob: flag, w_inv, y, w_x, w_y then the message.
 pub fn encode_to_g1(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
     const NU_TOTAL: usize = W_MAP + 2 * 48;
     let (wits, msg) = split_witness(payload, NU_TOTAL)?;
-    let w_xd = wit48(&wits[W_MAP..W_MAP + 48])?;
-    let w_yd = wit48(&wits[W_MAP + 48..])?;
+    let w_x = wit48(&wits[W_MAP..W_MAP + 48])?;
+    let w_y = wit48(&wits[W_MAP + 48..])?;
 
     let u = hash_to_field_nu(dst, msg);
     let p = map_to_curve_witnessed(&u, &wits[..W_MAP])?;
-    let (x, y) = iso_map_witnessed(&p, &w_xd, &w_yd)?;
+    let (x, y) = iso_map_witnessed(&p, &w_x, &w_y)?;
     let cleared = clear_cofactor(&point_bytes(&x, &y))?;
     validate(&cleared)?;
     Ok(cleared.to_vec())
 }
 
 pub fn hash_to_g1(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    hash_to_g1_prefix(dst, 3, payload)
+}
+
+/// Cumulative stage prefixes of the pipeline for stage by stage CU
+/// measurement; stage 3 is the full hash
+#[doc(hidden)]
+pub fn hash_to_g1_prefix(dst: &[u8], stage: u8, payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
     let (wits, msg) = split_witness(payload, W_TOTAL)?;
 
     let u = hash_to_field_folded(dst, msg);
+    if stage == 0 {
+        return Ok(limbs_to_be(&u[0].canonical).to_vec());
+    }
+
     let p0 = map_to_curve_witnessed(&u[0], &wits[..W_MAP])?;
     let p1 = map_to_curve_witnessed(&u[1], &wits[W_MAP..2 * W_MAP])?;
+    if stage == 1 {
+        return Ok(limbs_to_be(&p1.x).to_vec());
+    }
 
     let base = 2 * W_MAP;
-    let w_dx = wit48(&wits[base..base + 48])?;
-    let w_xd = wit48(&wits[base + 48..base + 96])?;
-    let w_yd = wit48(&wits[base + 96..base + 144])?;
+    let w_lambda = wit48(&wits[base..base + 48])?;
+    let w_x = wit48(&wits[base + 48..base + 96])?;
+    let w_y = wit48(&wits[base + 96..base + 144])?;
 
-    let sum = add_prime_witnessed(&p0, &p1, &w_dx)?;
-    let (x, y) = iso_map_witnessed(&sum, &w_xd, &w_yd)?;
+    let sum = add_prime_witnessed(&p0, &p1, &w_lambda)?;
+    let (x, y) = iso_map_witnessed(&sum, &w_x, &w_y)?;
+    if stage == 2 {
+        return Ok(x.to_vec());
+    }
 
     let cleared = clear_cofactor(&point_bytes(&x, &y))?;
     validate(&cleared)?;
@@ -542,6 +544,8 @@ pub fn hash_to_g1(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
 #[cfg(not(target_os = "solana"))]
 pub mod witness {
     use super::*;
+    use crate::consts_g1::{ISO11_XDEN, ISO11_XNUM, ISO11_YDEN, ISO11_YNUM, R2};
+    use alloc::vec;
 
     /// The adapted chains must agree with Horner over the original
     /// coefficient tables at arbitrary points.
@@ -572,7 +576,7 @@ pub mod witness {
             samples.push(x);
         }
         for s in &samples {
-            assert_eq!(mont_redc_cios32(s), mont_mul(s, &one), "redc != from_mont");
+            assert_eq!(from_mont(s), mont_mul(s, &one), "redc != from_mont");
         }
     }
 
@@ -606,13 +610,24 @@ pub mod witness {
     pub fn generate_nu(msg: &[u8]) -> Vec<u8> {
         let elem = hash_to_field_nu(crate::dst::G1_NU, msg);
         let (blob_map, point) = map_blob(&elem);
+        let (x_out, y_out) = iso_outputs(&point);
         let mut blob = blob_map;
-        let x_den = horner(&ISO11_XDEN, &point.x);
-        let y_den = horner(&ISO11_YDEN, &point.x);
-        blob.extend_from_slice(&inverse(&x_den));
-        blob.extend_from_slice(&inverse(&y_den));
+        blob.extend_from_slice(&limbs_to_be(&x_out));
+        blob.extend_from_slice(&limbs_to_be(&y_out));
         blob.extend_from_slice(msg);
         blob
+    }
+
+    /// The iso-11 image of an E' point, Montgomery form: the witnessed
+    /// output coordinates.
+    fn iso_outputs(p: &PointPrime) -> (Fp, Fp) {
+        let x_num = horner(&ISO11_XNUM, &p.x);
+        let y_num = horner(&ISO11_YNUM, &p.x);
+        let x_den = horner(&ISO11_XDEN, &p.x);
+        let y_den = horner(&ISO11_YDEN, &p.x);
+        let x_out = mont_mul(&x_num, &pow_mont(&x_den, &exp_inverse()));
+        let y_out = mont_mul(&mont_mul(&p.y, &y_num), &pow_mont(&y_den, &exp_inverse()));
+        (x_out, y_out)
     }
 
     /// One map's witness blob plus the mapped E' point.
@@ -641,7 +656,7 @@ pub mod witness {
         }
         let mut blob = vec![flag];
         blob.extend_from_slice(&w_inv);
-        blob.extend_from_slice(&limbs_to_be(&y_c));
+        blob.extend_from_slice(&limbs_to_be(&y_m));
         (blob, PointPrime { x, y: to_mont(&y_final) })
     }
 
@@ -681,26 +696,27 @@ pub mod witness {
 
             blob.push(flag);
             blob.extend_from_slice(&w_inv);
-            blob.extend_from_slice(&limbs_to_be(&y_c));
+            blob.extend_from_slice(&limbs_to_be(&y_m));
 
             points.push(PointPrime { x, y: to_mont(&y_final) });
         }
 
         let dx = sub_mod(&points[1].x, &points[0].x);
-        blob.extend_from_slice(&inverse(&dx));
-
         let inv_m = be_to_limbs(&inverse(&dx));
         let lambda = mont_mul(&sub_mod(&points[1].y, &points[0].y), &inv_m);
+        blob.extend_from_slice(&limbs_to_be(&lambda));
+
         let x3 = sub_mod(
             &sub_mod(&mont_mul(&lambda, &lambda), &points[0].x),
             &points[1].x,
         );
-        let sum_x = x3;
-
-        let x_den = horner(&ISO11_XDEN, &sum_x);
-        let y_den = horner(&ISO11_YDEN, &sum_x);
-        blob.extend_from_slice(&inverse(&x_den));
-        blob.extend_from_slice(&inverse(&y_den));
+        let y3 = sub_mod(
+            &mont_mul(&lambda, &sub_mod(&points[0].x, &x3)),
+            &points[0].y,
+        );
+        let (x_out, y_out) = iso_outputs(&PointPrime { x: x3, y: y3 });
+        blob.extend_from_slice(&limbs_to_be(&x_out));
+        blob.extend_from_slice(&limbs_to_be(&y_out));
 
         assert_eq!(blob.len(), W_TOTAL);
         blob

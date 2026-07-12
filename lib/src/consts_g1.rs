@@ -1,5 +1,90 @@
-// BLS12-381 G1 SSWU + iso-11 constants, Montgomery form (R = 2^384 mod p),
-// limbs little-endian; extracted from bls12_381 0.8.0 map_g1.rs / fp.rs.
+// BLS12-381 G1 SSWU + iso-11 constants, Montgomery form, limbs little-endian;
+// extracted from bls12_381 0.8.0 map_g1.rs / fp.rs.
+//
+// The literals below are transcribed in the source tables' R = 2^384 domain.
+// The ps30 multiplier (fp.rs) reduces by 2^390 per multiply, so the crate's
+// working Montgomery radix is R = 2^390 mod p: ms()/msa()/msa2() lift each
+// constant to that domain at compile time with 6 modular doublings (msn 12
+// for R2, which carries two factors of R).
+
+const fn c_geq(a: &[u64; 6], b: &[u64; 6]) -> bool {
+    let mut i = 5;
+    loop {
+        if a[i] > b[i] {
+            return true;
+        }
+        if a[i] < b[i] {
+            return false;
+        }
+        if i == 0 {
+            return true;
+        }
+        i -= 1;
+    }
+}
+
+const fn c_sub_p(a: [u64; 6]) -> [u64; 6] {
+    let mut r = [0u64; 6];
+    let mut borrow = 0u64;
+    let mut i = 0;
+    while i < 6 {
+        let (d, b1) = a[i].overflowing_sub(MODULUS[i]);
+        let (d, b2) = d.overflowing_sub(borrow);
+        r[i] = d;
+        borrow = (b1 as u64) + (b2 as u64);
+        i += 1;
+    }
+    r
+}
+
+const fn dbl_mod(a: [u64; 6]) -> [u64; 6] {
+    // a < p < 2^382: doubling never carries out of the top limb.
+    let mut r = [0u64; 6];
+    let mut carry = 0u64;
+    let mut i = 0;
+    while i < 6 {
+        r[i] = (a[i] << 1) | carry;
+        carry = a[i] >> 63;
+        i += 1;
+    }
+    if c_geq(&r, &MODULUS) {
+        c_sub_p(r)
+    } else {
+        r
+    }
+}
+
+pub(crate) const fn msn(mut x: [u64; 6], n: u32) -> [u64; 6] {
+    let mut i = 0;
+    while i < n {
+        x = dbl_mod(x);
+        i += 1;
+    }
+    x
+}
+
+pub(crate) const fn ms(x: [u64; 6]) -> [u64; 6] {
+    msn(x, 6)
+}
+
+pub(crate) const fn msa<const N: usize>(mut x: [[u64; 6]; N]) -> [[u64; 6]; N] {
+    let mut i = 0;
+    while i < N {
+        x[i] = ms(x[i]);
+        i += 1;
+    }
+    x
+}
+
+pub(crate) const fn msa2<const N: usize>(mut x: [[[u64; 6]; 2]; N]) -> [[[u64; 6]; 2]; N] {
+    let mut i = 0;
+    while i < N {
+        x[i][0] = ms(x[i][0]);
+        x[i][1] = ms(x[i][1]);
+        i += 1;
+    }
+    x
+}
 
 pub const MODULUS: [u64; 6] = [
     0xb9feffffffffaaab,
@@ -12,52 +97,52 @@ pub const MODULUS: [u64; 6] = [
 
 pub const INV: u64 = 0x89f3fffcfffcfffd;
 
-pub const R2: [u64; 6] = [
+pub const R2: [u64; 6] = msn([
     0xf4df1f341c341746,
     0x0a76e6a609d104f1,
     0x8de5476c4c95b6d5,
     0x67eb88a9939d83c0,
     0x9a793e85b519952d,
     0x11988fe592cae3aa,
-];
+], 12);
 
-pub const R: [u64; 6] = [
+pub const R: [u64; 6] = ms([
     0x760900000002fffd,
     0xebf4000bc40c0002,
     0x5f48985753c758ba,
     0x77ce585370525745,
     0x5c071a97a256ec6d,
     0x15f65ec3fa80e493,
-];
+]);
 
-pub const SSWU_ELLP_A: [u64; 6] = [
+pub const SSWU_ELLP_A: [u64; 6] = ms([
     0x2f65aa0e9af5aa51,
     0x86464c2d1e8416c3,
     0xb85ce591b7bd31e2,
     0x27e11c91b5f24e7c,
     0x28376eda6bfc1835,
     0x155455c3e5071d85,
-];
+]);
 
-pub const SSWU_ELLP_B: [u64; 6] = [
+pub const SSWU_ELLP_B: [u64; 6] = ms([
     0xfb996971fe22a1e0,
     0x9aa93eb35b742d6f,
     0x8c476013de99c5c4,
     0x873e27c3a221e571,
     0xca72b5e45a52d888,
     0x06824061418a386b,
-];
+]);
 
-pub const SSWU_XI: [u64; 6] = [
+pub const SSWU_XI: [u64; 6] = ms([
     0x886c00000023ffdc,
     0x0f70008d3090001d,
     0x77672417ed5828c3,
     0x9dac23e943dc1740,
     0x50553f1b9c131521,
     0x078c712fbe0ab6e8,
-];
+]);
 
-pub const ISO11_XNUM: [[u64; 6]; 12] = [
+pub const ISO11_XNUM: [[u64; 6]; 12] = msa([
     [0x4d18b6f3af00131c, 0x19fa219793fee28c, 0x3f2885f1467f19ae, 0x23dcea34f2ffb304, 0xd15b58d2ffc00054, 0x0913be200a20bef4],
     [0x898985385cdbbd8b, 0x3c79e43cc7d966aa, 0x1597e193f4cd233a, 0x8637ef1e4d6623ad, 0x11b22deed20d827b, 0x07097bc5998784ad],
     [0xa542583a480b664b, 0xfc7169c026e568c6, 0x5ba2ef314ed8b5a6, 0x5b5491c05102f0e7, 0xdf6e99707d2a0079, 0x0784151ed7605524],
@@ -70,9 +155,9 @@ pub const ISO11_XNUM: [[u64; 6]; 12] = [
     [0x0de5c357bff57107, 0x0a0db4ae6b1a10b2, 0xe256bb67b3b3cd8d, 0x8ad456574e9db24f, 0x0443915f50fd4179, 0x098c4bf7de8b6375],
     [0xe6b0617e7dd929c7, 0xfe6e37d442537375, 0x1dafdeda137a489e, 0xe4efd1ad3f767ceb, 0x4a51d8667f0fe1cf, 0x054fdf4bbf1d821c],
     [0x72db2a50658d767b, 0x8abf91faa257b3d5, 0xe969d6833764ab47, 0x464170142a1009eb, 0xb14f01aadb30be2f, 0x18ae6a856f40715d],
-];
+]);
 
-pub const ISO11_XDEN: [[u64; 6]; 11] = [
+pub const ISO11_XDEN: [[u64; 6]; 11] = msa([
     [0xb962a077fdb0f945, 0xa6a9740fefda13a0, 0xc14d568c3ed6c544, 0xb43fc37b908b133e, 0x9c0b3ac929599016, 0x0165aa6c93ad115f],
     [0x23279a3ba506c1d9, 0x92cfca0a9465176a, 0x3b294ab13755f0ff, 0x116dda1c5070ae93, 0xed4530924cec2045, 0x083383d6ed81f1ce],
     [0x9885c2a6449fecfc, 0x4a2b54ccd37733f0, 0x17da9ffd8738c142, 0xa0fba72732b3fafd, 0xff364f36e54b6812, 0x0f29c13c660523e2],
@@ -84,9 +169,9 @@ pub const ISO11_XDEN: [[u64; 6]; 11] = [
     [0x1be3ff439c1316fd, 0x9965243a7571dfa7, 0xc7f7f62962f5cd81, 0x32c6aa9af394361c, 0xbbc2ee18e1c227f4, 0x0c102cbac531bb34],
     [0x997614c97bacbf07, 0x61f86372b99192c0, 0x5b8c95fc14353fc3, 0xca2b066c2a87492f, 0x16178f5bbf698711, 0x12a6dcd7f0f4e0e8],
     [0x760900000002fffd, 0xebf4000bc40c0002, 0x5f48985753c758ba, 0x77ce585370525745, 0x5c071a97a256ec6d, 0x15f65ec3fa80e493],
-];
+]);
 
-pub const ISO11_YNUM: [[u64; 6]; 16] = [
+pub const ISO11_YNUM: [[u64; 6]; 16] = msa([
     [0x2b567ff3e2837267, 0x1d4d9e57b958a767, 0xce028fea04bd7373, 0xcc31a30a0b6cd3df, 0x7d7b18a682692693, 0x0d300744d42a0310],
     [0x99c2555fa542493f, 0xfe7f53cc4874f878, 0x5df0608b8f97608a, 0x14e03832052b49c8, 0x706326a6957dd5a4, 0x0a8dadd9c2414555],
     [0x13d942922a5cf63a, 0x357e33e36e261e7d, 0xcf05a27c8456088d, 0x0000bd1de7ba50f0, 0x83d0c7532f8c1fde, 0x13f70bf38bbf2905],
@@ -103,9 +188,9 @@ pub const ISO11_YNUM: [[u64; 6]; 16] = [
     [0x93096bb538d64615, 0x6f2a2619951d823a, 0x8f66b3ea59514fa4, 0xf563e63704f7092f, 0x724b136c4cf2d9fa, 0x046959cfcfd0bf49],
     [0xea748d4b6e405346, 0x91e9079c2c02d58f, 0x41064965946d9b59, 0xa06731f1d2bbe1ee, 0x07f897e267a33f1b, 0x1017290919210e5f],
     [0x872aa6c17d985097, 0xeecc53161264562a, 0x07afe37afff55002, 0x54759078e5be6838, 0xc4b92d15db8acca8, 0x106d87d1b51d13b9],
-];
+]);
 
-pub const ISO11_YDEN: [[u64; 6]; 16] = [
+pub const ISO11_YDEN: [[u64; 6]; 16] = msa([
     [0xeb6c359d47e52b1c, 0x18ef5f8a10634d60, 0xddfa71a0889d5b7e, 0x723e71dcc5fc1323, 0x52f45700b70d5c69, 0x0a8b981ee47691f1],
     [0x616a3c4f5535b9fb, 0x6f5f037395dbd911, 0xf25f4cc5e35c65da, 0x3e50dffea3c62658, 0x6a33dca523560776, 0x0fadeff77b6bfe3e],
     [0x2be9b66df470059c, 0x24a2c159a3d36742, 0x115dbe7ad10c2a37, 0xb6634a652ee5884d, 0x04fe8bb2b8d81af4, 0x01c2a7a256fe9c41],
@@ -122,83 +207,20 @@ pub const ISO11_YDEN: [[u64; 6]; 16] = [
     [0x7ebd546ca1575ed2, 0xe47d5a981d081b55, 0x57b2b625b6d4ca21, 0xb0a1ba04228520cc, 0x98738983c2107ff3, 0x13dddbc4799d81d6],
     [0x09319f2e39834935, 0x039e952cbdb05c21, 0x55ba77a9a2f76493, 0xfd04e3dfc6086467, 0xfb95832e7d78742e, 0x0ef9c24eccaf5e0e],
     [0x760900000002fffd, 0xebf4000bc40c0002, 0x5f48985753c758ba, 0x77ce585370525745, 0x5c071a97a256ec6d, 0x15f65ec3fa80e493],
-];
+]);
 
 
-pub const SSWU_C1_NEG_B_OVER_A: [u64; 6] = [
+pub const SSWU_C1_NEG_B_OVER_A: [u64; 6] = ms([
     0x052583c93555a7fe,
     0x3b40d72430f93c82,
     0x1b75faa0105ec983,
     0x2527e7dc63851767,
     0x99fffd1f34fc181d,
     0x097cab54770ca0d3,
-];
+]);
 
 // Shallue-van de Woestijne direct-map constants (Wahby-Boneh eprint
 // 2019/403 section 3, u0 = -3), Montgomery form, derived offline.
-
-pub const SVDW_U0: [u64; 6] = [
-    0xcbe1fffffff6000a,
-    0x9827ffd8c7d7fff7,
-    0x17b8aedce8bcd83b,
-    0xc5fad9948998326e,
-    0xcd3da75be2de413d,
-    0x0c201972bcfd0614,
-];
-
-pub const SVDW_NEG_U0: [u64; 6] = [
-    0xee1d00000009aaa1,
-    0x86840025e97c0007,
-    0x4f7823c40df41de8,
-    0x9e7c71f069ece051,
-    0x7dde005a606d6b99,
-    0x0de0f8777c82e085,
-];
-
-pub const SVDW_F_U0: [u64; 6] = [
-    0xed1cffffffb455a1,
-    0x3283fed73d7bffc1,
-    0x804ac4babeea4207,
-    0x15c7f6e3eeff9fb8,
-    0x9985b69dac1a42fe,
-    0x0ef2e2b0fc697ad0,
-];
-
-pub const SVDW_SQRT_M27: [u64; 6] = [
-    0x6039bb5b26b74d45,
-    0x007ecdd28055e2fa,
-    0xf6f4c41d3aecfe90,
-    0x9bf50546bf2f358a,
-    0xd31102abe389437c,
-    0x077b4f5a1dd8a46d,
-];
-
-pub const SVDW_C1: [u64; 6] = [
-    0x272b5dad93607bf3,
-    0x438166fc34e8f181,
-    0x233673f0a4708e3c,
-    0x1d38bb9b948e0aee,
-    0xa877818321fb578b,
-    0x0aae23e8cd2dc279,
-];
-
-pub const SVDW_INV_3U0SQ: [u64; 6] = [
-    0x158e425ed097b74f,
-    0x5dadc71c7e2c4bda,
-    0x9d5d01ae2fc08e96,
-    0x482181f1982a7a90,
-    0x2324e6d352d74573,
-    0x0884b37c10d55646,
-];
-
-pub const SVDW_B: [u64; 6] = [
-    0xaa270000000cfff3,
-    0x53cc0032fc34000a,
-    0x478fe97a6b0a807f,
-    0xb1d37ebee6ba24d7,
-    0x8ec9733bbf78ab2f,
-    0x09d645513d83de7e,
-];
 
 // Knuth-adapted evaluation constants for the iso-11 polynomials
 // (TAOCP 4.6.4 style preprocessing): each polynomial becomes a chain
@@ -209,7 +231,7 @@ pub const SVDW_B: [u64; 6] = [
 // base constants, then one (gamma, eps) pair per stage, 
 // then the leading coefficient if not monic.
 
-pub const ISO11A_XNUM: [[u64; 6]; 12] = [
+pub const ISO11A_XNUM: [[u64; 6]; 12] = msa([
     [
         0xef4f14c97b9fbf14,
         0x0e2c633fbd5d92b5,
@@ -306,9 +328,9 @@ pub const ISO11A_XNUM: [[u64; 6]; 12] = [
         0xb14f01aadb30be2f,
         0x18ae6a856f40715d,
     ],
-];
+]);
 
-pub const ISO11A_XDEN: [[u64; 6]; 10] = [
+pub const ISO11A_XDEN: [[u64; 6]; 10] = msa([
     [
         0x334514c97b9c69c2,
         0x40e46332aaa592b3,
@@ -389,9 +411,9 @@ pub const ISO11A_XDEN: [[u64; 6]; 10] = [
         0xb63e62150059bafc,
         0x0df34d04acb09d20,
     ],
-];
+]);
 
-pub const ISO11A_YNUM: [[u64; 6]; 16] = [
+pub const ISO11A_YNUM: [[u64; 6]; 16] = msa([
     [
         0x5f0a9f2e39764942,
         0xafd294f9c17c5c16,
@@ -520,9 +542,9 @@ pub const ISO11A_YNUM: [[u64; 6]; 16] = [
         0xc4b92d15db8acca8,
         0x106d87d1b51d13b9,
     ],
-];
+]);
 
-pub const ISO11A_YDEN: [[u64; 6]; 15] = [
+pub const ISO11A_YDEN: [[u64; 6]; 15] = msa([
     [
         0x5f0a9f2e39764942,
         0xafd294f9c17c5c16,
@@ -643,4 +665,4 @@ pub const ISO11A_YDEN: [[u64; 6]; 15] = [
         0x1c726dedbceefa17,
         0x094a5f563d6a6ff4,
     ],
-];
+]);

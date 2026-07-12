@@ -11,14 +11,13 @@
 use solana_program_error::ProgramError;
 use alloc::vec::Vec;
 
-use crate::consts_g1::R;
 use crate::fp2::*;
 use crate::fp::{split_witness, 
-    add_mod, be_to_limbs, is_zero, limbs_to_be, mont_mul, neg_mod, sub_mod, sys,
+    add_mod, be_to_limbs, limbs_to_be, mont_mul, neg_mod, sub_mod, sys,
     to_mont, Fp,
 };
 use crate::consts_g2::{
-    C256_MONT, ISO3A_XDEN, ISO3A_XNUM, ISO3A_YDEN, ISO3A_YNUM, ISO3_XDEN, ISO3_YDEN,
+    C256_MONT, ISO3A_XDEN, ISO3A_XNUM, ISO3A_YDEN, ISO3A_YNUM,
     PSI2_X_C0, PSI_X_C1, PSI_Y,
     SSWU2_C1_NEG_B_OVER_A, SSWU2_ELLP_B,
 };
@@ -30,10 +29,23 @@ const OP_ADD: u64 = 0;
 const OP_SUB: u64 = 1;
 const POINT: usize = 192;
 
-// blob: flag0, y0, flag1, y1, w_tv2_pair, w_dx, w_den_pair
-const W_TOTAL: usize = 2 * (1 + 96) + 3 * 96;
+// blob: flag0, y0, flag1, y1, tv2 witness(es), w_lambda, w_x, w_y
+//
+// Where an inverse feeds exactly one product (the E' slope, the iso-3
+// output coordinates) the result is witnessed instead and pinned with a
+// single multiply. 
+#[cfg(feature = "wide-witness")]
+const W_TV2: usize = 2 * 96;
+#[cfg(not(feature = "wide-witness"))]
+const W_TV2: usize = 96;
+const W_TOTAL: usize = 2 * (1 + 96) + W_TV2 + 3 * 96;
 
-fn expand_message_xmd_g2(dst: &[u8], msg: &[u8]) -> [[u8; 32]; 8] {
+// Compile time layout guards: the parse offsets below assume this exact
+// blob shape in both feature configurations.
+const _: () = assert!(W_TOTAL == 578 || W_TOTAL == 674);
+const _: () = assert!(194 + W_TV2 + 3 * 96 == W_TOTAL);
+
+pub(crate) fn expand_message_xmd_g2(dst: &[u8], msg: &[u8]) -> [[u8; 32]; 8] {
     use solana_sha256_hasher::hashv;
 
     let z_pad = [0u8; 64];
@@ -86,7 +98,7 @@ fn hash_to_field_g2(dst: &[u8], msg: &[u8]) -> [Elem2; 2] {
     elems
 }
 
-fn gx2_at(x: &Fp2) -> Fp2 {
+pub(crate) fn gx2_at(x: &Fp2) -> Fp2 {
     // x^3 + A x + B, with A of the form (0, a)
     let x3 = mul2(&sq2(x), x);
     let ax = mul_by_a2i(x);
@@ -101,8 +113,27 @@ pub(crate) fn check_inverse2(v: &Fp2, witness_m: &Fp2) -> Result<Fp2, ProgramErr
     Ok(*witness_m)
 }
 
+/// One pair inversion witness pins both tv2 inverses through a single
+/// product check, four mul2 for the smaller blob
+#[cfg(not(feature = "wide-witness"))]
+fn check_tv2_inverses(a: &Fp2, b: &Fp2, wit: &[u8]) -> Result<(Fp2, Fp2), ProgramError> {
+    let w = wit96(wit)?;
+    if mul2(&mul2(a, b), &w) != ONE2 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok((mul2(&w, b), mul2(&w, a)))
+}
+
+/// Two direct inverse witnesses, two mul2 for 96 more blob bytes
+#[cfg(feature = "wide-witness")]
+fn check_tv2_inverses(a: &Fp2, b: &Fp2, wit: &[u8]) -> Result<(Fp2, Fp2), ProgramError> {
+    let inv0 = check_inverse2(a, &wit96(&wit[..96])?)?;
+    let inv1 = check_inverse2(b, &wit96(&wit[96..])?)?;
+    Ok((inv0, inv1))
+}
+
 /// xi2 = -(2 + i): (a + bi)(-2 - i) = (b - 2a) - (a + 2b) i. Adds only.
-fn mul_by_xi2(v: &Fp2) -> Fp2 {
+pub(crate) fn mul_by_xi2(v: &Fp2) -> Fp2 {
     let a2 = add_mod(&v.c0, &v.c0);
     let b2 = add_mod(&v.c1, &v.c1);
     Fp2 {
@@ -124,7 +155,7 @@ fn mul_fp_240(a: &Fp) -> Fp {
 }
 
 /// Multiply by A' = 240 i: (a + bi)(240 i) = -240 b + 240 a i.
-fn mul_by_a2i(v: &Fp2) -> Fp2 {
+pub(crate) fn mul_by_a2i(v: &Fp2) -> Fp2 {
     Fp2 {
         c0: neg_mod(&mul_fp_240(&v.c1)),
         c1: mul_fp_240(&v.c0),
@@ -144,15 +175,6 @@ fn sswu_pre(u: &Elem2) -> Result<SswuPre, ProgramError> {
         return Err(ProgramError::InvalidInstructionData);
     }
     Ok(SswuPre { xi_usq, tv2 })
-}
-
-/// Montgomery pair inversion: one witness w = (a*b)^-1 pins both inverses,
-/// since a wrong w fails the single product check and inverses are unique.
-fn check_pair_inverse(a: &Fp2, b: &Fp2, witness_m: &Fp2) -> Result<(Fp2, Fp2), ProgramError> {
-    if mul2(&mul2(a, b), witness_m) != ONE2 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    Ok((mul2(witness_m, b), mul2(witness_m, a)))
 }
 
 fn sswu_finish(
@@ -183,31 +205,35 @@ fn sswu_finish(
         return Err(ProgramError::InvalidInstructionData);
     }
 
-    let yw_m = to_mont2(y_w);
-    if sq2(&yw_m) != gx {
+    // The sqrt witness arrives in Montgomery form (a redc to read its sign
+    // is cheaper than a to_mont to square-check it); negation commutes with
+    // the Montgomery map, so the sign fix applies to the form we keep.
+    let y_c = from_mont2(y_w);
+    if sq2(y_w) != gx {
         return Err(ProgramError::InvalidInstructionData);
     }
-
-    // Negation commutes with the Montgomery map, so flip the square root we
-    // already converted rather than converting the canonical value a second time.
-    let y = if sgn0_fp2(y_w) != sgn0_fp2(&u.canonical) {
-        neg2(&yw_m)
+    let y = if sgn0_fp2(&y_c) != sgn0_fp2(&u.canonical) {
+        neg2(y_w)
     } else {
-        yw_m
+        *y_w
     };
 
     Ok(Point2 { x, y })
 }
 
-pub(crate) fn add_prime_witnessed(p: &Point2, q: &Point2, w_dx: &Fp2) -> Result<Point2, ProgramError> {
+/// The slope itself is witnessed (not 1/dx): lambda * dx == dy pins it with
+/// one multiply, and dx != 0 makes it unique.
+pub(crate) fn add_prime_witnessed(p: &Point2, q: &Point2, w_lambda: &Fp2) -> Result<Point2, ProgramError> {
     if p.x == q.x {
         return Err(ProgramError::InvalidInstructionData);
     }
     let dx = sub2(&q.x, &p.x);
-    let inv = check_inverse2(&dx, w_dx)?;
-    let lambda = mul2(&sub2(&q.y, &p.y), &inv);
-    let x3 = sub2(&sub2(&sq2(&lambda), &p.x), &q.x);
-    let y3 = sub2(&mul2(&lambda, &sub2(&p.x, &x3)), &p.y);
+    let dy = sub2(&q.y, &p.y);
+    if mul2(w_lambda, &dx) != dy {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let x3 = sub2(&sub2(&sq2(w_lambda), &p.x), &q.x);
+    let y3 = sub2(&mul2(w_lambda, &sub2(&p.x, &x3)), &p.y);
     Ok(Point2 { x: x3, y: y3 })
 }
 
@@ -222,7 +248,7 @@ fn horner2(coeffs: &[[[u64; 6]; 2]], x: &Fp2) -> Fp2 {
 /// Adapted iso-3 evaluation: cubics as (y + g)(w + q1) + q0, the degree-2
 /// denominator via its tiny coefficients (12 - 12i, -72i) as adds. Five
 /// Fp2 multiplications plus one squaring against eleven for Horner.
-fn iso3_adapted(x: &Fp2) -> (Fp2, Fp2, Fp2, Fp2) {
+pub(crate) fn iso3_adapted(x: &Fp2) -> (Fp2, Fp2, Fp2, Fp2) {
     fn m12(a: &Fp) -> Fp {
         let a2 = add_mod(a, a);
         let a4 = add_mod(&a2, &a2);
@@ -230,8 +256,12 @@ fn iso3_adapted(x: &Fp2) -> (Fp2, Fp2, Fp2, Fp2) {
     }
     let w = sq2(x);
 
+    // sums ride unreduced: every one is a mul2 operand or checked via mul2
     let cubic = |k: &[[[u64; 6]; 2]]| {
-        add2(&mul2(&add2(x, &fp2(&k[0])), &add2(&w, &fp2(&k[1]))), &fp2(&k[2]))
+        add2_unreduced(
+            &mul2(&add2_unreduced(x, &fp2(&k[0])), &add2_unreduced(&w, &fp2(&k[1]))),
+            &fp2(&k[2]),
+        )
     };
     let x_num = mul2(&cubic(&ISO3A_XNUM), &fp2(&ISO3A_XNUM[3]));
     let y_num = mul2(&cubic(&ISO3A_YNUM), &fp2(&ISO3A_YNUM[3]));
@@ -241,18 +271,28 @@ fn iso3_adapted(x: &Fp2) -> (Fp2, Fp2, Fp2, Fp2) {
         c0: m12(&add_mod(&x.c0, &x.c1)),
         c1: m12(&sub_mod(&x.c1, &x.c0)),
     };
-    let x_den = add2(&add2(&w, &k1x), &fp2(&ISO3A_XDEN[1]));
+    let x_den = add2_unreduced(&add2_unreduced(&w, &k1x), &fp2(&ISO3A_XDEN[1]));
     (x_num, x_den, y_num, y_den)
 }
 
-fn iso_map_witnessed(p: &Point2, w_den: &Fp2) -> Result<[u8; POINT], ProgramError> {
+/// The output coordinates are witnessed (Montgomery form) instead of the
+/// denominator inverses: x * x_den == x_num pins x with one multiply per
+/// coordinate. The RFC 9380 iso-3 numerators and denominators are coprime,
+/// so both vanishing at once is impossible; a zero denominator (point maps
+/// to infinity) is rejected as before.
+fn iso_map_witnessed(p: &Point2, w_x: &Fp2, w_y: &Fp2) -> Result<[u8; POINT], ProgramError> {
     let (x_num, x_den, y_num, y_den) = iso3_adapted(&p.x);
 
-    let (xd_inv, yd_inv) = check_pair_inverse(&x_den, &y_den, w_den)?;
-
-    let x = mul2(&x_num, &xd_inv);
-    let y = mul2(&p.y, &mul2(&y_num, &yd_inv));
-    Ok(point_bytes(&from_mont2(&x), &from_mont2(&y)))
+    if is_zero2(&x_den) || is_zero2(&y_den) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if mul2(w_x, &x_den) != x_num {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if mul2(w_y, &y_den) != mul2(&y_num, &p.y) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok(point_bytes(&from_mont2(w_x), &from_mont2(w_y)))
 }
 
 /// Zcash uncompressed layout: x.c1 || x.c0 || y.c1 || y.c0, big-endian.
@@ -278,14 +318,23 @@ fn parse_point(bytes: &[u8; POINT]) -> (Fp2, Fp2) {
 }
 
 fn g2_group_op(op: u64, a: &[u8; POINT], b: &[u8; POINT]) -> Result<[u8; POINT], ProgramError> {
-    let mut out = [0u8; POINT];
+    // The syscall fills the whole point on success, so skip the zero-init;
+    // the pointer escapes and LLVM cannot drop the memset on its own.
+    let mut out = core::mem::MaybeUninit::<[u8; POINT]>::uninit();
     let rc = unsafe {
-        sys::sol_curve_group_op(BLS12_381_G2_BE, op, a.as_ptr(), b.as_ptr(), out.as_mut_ptr())
+        sys::sol_curve_group_op(
+            BLS12_381_G2_BE,
+            op,
+            a.as_ptr(),
+            b.as_ptr(),
+            out.as_mut_ptr() as *mut u8,
+        )
     };
     if rc != 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
-    Ok(out)
+    // SAFETY: rc == 0 means the syscall wrote all POINT bytes
+    Ok(unsafe { out.assume_init() })
 }
 
 fn g2_add(a: &[u8; POINT], b: &[u8; POINT]) -> Result<[u8; POINT], ProgramError> {
@@ -387,45 +436,64 @@ fn hash_to_field_nu(dst: &[u8], msg: &[u8]) -> Elem2 {
 }
 
 /// Witnessed encode_to_curve (RFC 9380 NU): one map, no addition.
-/// Blob: flag, y, w_tv2, w_den then the message.
+/// Blob: flag, y, w_tv2, w_x, w_y then the message.
 pub fn encode_to_g2(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
-    const NU_TOTAL: usize = 1 + 96 + 96 + 96;
+    const NU_TOTAL: usize = 1 + 96 + 96 + 2 * 96;
     let (wits, msg) = split_witness(payload, NU_TOTAL)?;
     let flag = wits[0];
     let y = wit96(&wits[1..97])?;
     let w_tv2 = wit96(&wits[97..193])?;
-    let w_den = wit96(&wits[193..])?;
+    let w_x = wit96(&wits[193..289])?;
+    let w_y = wit96(&wits[289..])?;
 
     let u = hash_to_field_nu(dst, msg);
     let pre = sswu_pre(&u)?;
     let inv = check_inverse2(&pre.tv2, &w_tv2)?;
     let p = sswu_finish(&u, &pre, &inv, flag, &y)?;
-    let uncleared = iso_map_witnessed(&p, &w_den)?;
+    let uncleared = iso_map_witnessed(&p, &w_x, &w_y)?;
     let cleared = clear_cofactor(&uncleared)?;
     g2_validate(&cleared)?;
     Ok(cleared.to_vec())
 }
 
 pub fn hash_to_g2(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    hash_to_g2_prefix(dst, 3, payload)
+}
+
+/// Cumulative stage prefixes of the pipeline for stage by stage CU
+/// measurement; stage 3 is the full hash
+#[doc(hidden)]
+pub fn hash_to_g2_prefix(dst: &[u8], stage: u8, payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
     let (wits, msg) = split_witness(payload, W_TOTAL)?;
 
     let flag0 = wits[0];
     let y0 = wit96(&wits[1..97])?;
     let flag1 = wits[97];
     let y1 = wit96(&wits[98..194])?;
-    let w_tv2 = wit96(&wits[194..290])?;
-    let w_dx = wit96(&wits[290..386])?;
-    let w_den = wit96(&wits[386..482])?;
+    let tv2_witness = &wits[194..194 + W_TV2];
+    let w_lambda = wit96(&wits[194 + W_TV2..290 + W_TV2])?;
+    let w_x = wit96(&wits[290 + W_TV2..386 + W_TV2])?;
+    let w_y = wit96(&wits[386 + W_TV2..482 + W_TV2])?;
 
     let u = hash_to_field_g2(dst, msg);
+    if stage == 0 {
+        return Ok(limbs_to_be(&u[0].canonical.c0).to_vec());
+    }
+
     let pre0 = sswu_pre(&u[0])?;
     let pre1 = sswu_pre(&u[1])?;
-    let (inv0, inv1) = check_pair_inverse(&pre0.tv2, &pre1.tv2, &w_tv2)?;
+    let (inv0, inv1) = check_tv2_inverses(&pre0.tv2, &pre1.tv2, tv2_witness)?;
     let p0 = sswu_finish(&u[0], &pre0, &inv0, flag0, &y0)?;
     let p1 = sswu_finish(&u[1], &pre1, &inv1, flag1, &y1)?;
+    if stage == 1 {
+        return Ok(limbs_to_be(&p1.x.c0).to_vec());
+    }
 
-    let sum = add_prime_witnessed(&p0, &p1, &w_dx)?;
-    let uncleared = iso_map_witnessed(&sum, &w_den)?;
+    let sum = add_prime_witnessed(&p0, &p1, &w_lambda)?;
+    let uncleared = iso_map_witnessed(&sum, &w_x, &w_y)?;
+    if stage == 2 {
+        return Ok(uncleared.to_vec());
+    }
 
     let cleared = clear_cofactor(&uncleared)?;
     g2_validate(&cleared)?;
@@ -436,7 +504,10 @@ pub fn hash_to_g2(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
 #[cfg(not(target_os = "solana"))]
 pub mod witness {
     use super::*;
-    use crate::fp::{add_carryless, exp_inverse, exp_legendre, exp_sqrt, shr1};
+    use crate::consts_g1::R;
+    use crate::consts_g2::{ISO3_XDEN, ISO3_XNUM, ISO3_YDEN, ISO3_YNUM};
+    use crate::fp::{add_carryless, exp_inverse, exp_legendre, exp_sqrt, is_zero, shr1};
+    use alloc::vec;
 
     fn pow_mont(base: &Fp, exp_be: &[u8; 48]) -> Fp {
         let mut acc = R;
@@ -527,7 +598,7 @@ pub mod witness {
     pub fn flip_first_sqrt(blob: &[u8]) -> Vec<u8> {
         let y = wit96(&blob[1..97]).unwrap();
         let mut out = blob[..1].to_vec();
-        push_fp2(&mut out, &to_mont2(&neg2(&y)));
+        push_fp2_mont(&mut out, &neg2(&y));
         out.extend_from_slice(&blob[97..]);
         out
     }
@@ -551,14 +622,27 @@ pub mod witness {
             y_canonical = neg2(&y_canonical);
         }
         let point = Point2 { x, y: to_mont2(&y_canonical) };
-        let x_den = horner2(&ISO3_XDEN, &point.x);
-        let y_den = horner2(&ISO3_YDEN, &point.x);
+        let (x_out, y_out) = iso_outputs(&point);
         let mut blob = vec![flag];
-        push_fp2(&mut blob, &y);
+        push_fp2_mont(&mut blob, &y);
         push_fp2_mont(&mut blob, &w_tv2);
-        push_fp2_mont(&mut blob, &inv2(&mul2(&x_den, &y_den)));
+        push_fp2_mont(&mut blob, &x_out);
+        push_fp2_mont(&mut blob, &y_out);
         blob.extend_from_slice(msg);
         blob
+    }
+
+    /// The iso-3 image of an E' point, Montgomery form: the witnessed
+    /// output coordinates.
+    fn iso_outputs(p: &Point2) -> (Fp2, Fp2) {
+        let x_num = horner2(&ISO3_XNUM, &p.x);
+        let y_num = horner2(&ISO3_YNUM, &p.x);
+        let x_den = horner2(&ISO3_XDEN, &p.x);
+        let y_den = horner2(&ISO3_YDEN, &p.x);
+        let w = inv2(&mul2(&x_den, &y_den));
+        let x_out = mul2(&x_num, &mul2(&w, &y_den));
+        let y_out = mul2(&mul2(&p.y, &y_num), &mul2(&w, &x_den));
+        (x_out, y_out)
     }
 
     pub fn generate(msg: &[u8]) -> Vec<u8> {
@@ -594,23 +678,26 @@ pub mod witness {
         }
 
         let dx = sub2(&points[1].x, &points[0].x);
-        let dx_inv = inv2(&dx);
-
-        let lambda = mul2(&sub2(&points[1].y, &points[0].y), &dx_inv);
+        let lambda = mul2(&sub2(&points[1].y, &points[0].y), &inv2(&dx));
         let x3 = sub2(&sub2(&sq2(&lambda), &points[0].x), &points[1].x);
-
-        let x_den = horner2(&ISO3_XDEN, &x3);
-        let y_den = horner2(&ISO3_YDEN, &x3);
-        let w_den = inv2(&mul2(&x_den, &y_den));
+        let y3 = sub2(&mul2(&lambda, &sub2(&points[0].x, &x3)), &points[0].y);
+        let (x_out, y_out) = iso_outputs(&Point2 { x: x3, y: y3 });
 
         let mut blob = Vec::with_capacity(W_TOTAL);
         blob.push(flags[0]);
-        push_fp2(&mut blob, &ys[0]);
+        push_fp2_mont(&mut blob, &ys[0]);
         blob.push(flags[1]);
-        push_fp2(&mut blob, &ys[1]);
+        push_fp2_mont(&mut blob, &ys[1]);
+        #[cfg(not(feature = "wide-witness"))]
         push_fp2_mont(&mut blob, &w_tv2);
-        push_fp2_mont(&mut blob, &dx_inv);
-        push_fp2_mont(&mut blob, &w_den);
+        #[cfg(feature = "wide-witness")]
+        {
+            push_fp2_mont(&mut blob, &invs[0]);
+            push_fp2_mont(&mut blob, &invs[1]);
+        }
+        push_fp2_mont(&mut blob, &lambda);
+        push_fp2_mont(&mut blob, &x_out);
+        push_fp2_mont(&mut blob, &y_out);
 
         assert_eq!(blob.len(), W_TOTAL);
         blob

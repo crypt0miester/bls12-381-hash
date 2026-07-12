@@ -20,7 +20,8 @@ g1-ro = []
 g2-ro = []
 g1-nu = []
 g2-nu = []
-g1-svdw = []
-g2-svdw = []
 modexp = []
-full = ["g1-ro", "g2-ro", "g1-nu", "g2-nu", "g1-svdw", "g2-svdw", "modexp"]
+# 674 byte G2 blob: two direct tv2 inverse witnesses instead of one pair
+# inversion, 96 more bytes for about 14k less CU
+wide-witness = []
+full = ["g1-ro", "g2-ro", "g1-nu", "g2-nu", "modexp"]

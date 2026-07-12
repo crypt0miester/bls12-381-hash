@@ -14,3 +14,6 @@ bls12_381 = { version = "0.8.0", features = ["experimental"] }
 sha2 = "0.9"
 blst = "0.3"
 hex = "0.4"
+
+[features]
+wide-witness = ["bls381-hash/wide-witness"]
