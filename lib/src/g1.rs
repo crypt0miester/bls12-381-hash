@@ -116,7 +116,8 @@ fn map_to_curve_sswu(u: &Fp, c_neg_b_over_a: &Fp, exps: &Exps) -> Result<PointPr
     let gx1 = gx(&x1);
     let legendre = modexp(&from_mont(&gx1), &exps.legendre)?;
 
-    let (x, gx_val) = if is_one_canonical(&legendre) {
+    // is_square(0) is true, so gx1 == 0 takes the x1 branch to match blst.
+    let (x, gx_val) = if is_zero(&gx1) || is_one_canonical(&legendre) {
         (x1, gx1)
     } else {
         let x2 = mont_mul(&xi_usq, &x1);

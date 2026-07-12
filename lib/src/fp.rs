@@ -109,8 +109,7 @@ pub(crate) fn is_zero(a: &Fp) -> bool {
 }
 
 /// a + b without the modular reduction; only for mont_mul operands, which
-/// digest any value below 2^384 (sums stay below 2p, products below
-/// 2^768 < p 2^390, and the result is still below 2p)
+/// digest any value below 2^384.
 #[inline(always)]
 pub(crate) fn add_unreduced(a: &Fp, b: &Fp) -> Fp {
     let mut r = [0u64; 6];
@@ -120,6 +119,7 @@ pub(crate) fn add_unreduced(a: &Fp, b: &Fp) -> Fp {
         r[i] = s;
         carry = c;
     }
+    debug_assert_eq!(carry, 0, "add_unreduced: operand sum carried past 2^384");
     r
 }
 
