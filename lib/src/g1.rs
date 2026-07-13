@@ -582,12 +582,19 @@ pub mod witness {
     }
 
     fn pow_mont(base: &Fp, exp_be: &[u8; 48]) -> Fp {
+        let mut table = [R; 16];
+        table[1] = *base;
+        for i in 2..16 {
+            table[i] = mont_mul(&table[i - 1], base);
+        }
         let mut acc = R;
         for byte in exp_be {
-            for bit in (0..8).rev() {
-                acc = mont_mul(&acc, &acc);
-                if (byte >> bit) & 1 == 1 {
-                    acc = mont_mul(&acc, base);
+            for nib in [byte >> 4, byte & 0xf] {
+                for _ in 0..4 {
+                    acc = mont_mul(&acc, &acc);
+                }
+                if nib != 0 {
+                    acc = mont_mul(&acc, &table[nib as usize]);
                 }
             }
         }
