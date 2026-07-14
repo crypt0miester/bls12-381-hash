@@ -236,6 +236,62 @@ pub(crate) fn inverse_mont(a: &Fp, exp_inv: &[u8; 48]) -> Result<Fp, ProgramErro
     Ok(to_mont(&modexp(&from_mont(a), exp_inv)?))
 }
 
+#[inline(always)]
+pub(crate) fn is_one(a: &Fp) -> bool {
+    a[0] == 1 && (a[1] | a[2] | a[3] | a[4] | a[5]) == 0
+}
+
+/// Halve a residue mod p: even values shift, odd values add p first
+/// (x1 < p keeps the sum under 2^382, so no carry is lost).
+#[inline(always)]
+pub(crate) fn half_mod(a: &Fp) -> Fp {
+    if a[0] & 1 == 0 {
+        shr1(a)
+    } else {
+        shr1(&add_carryless(a))
+    }
+}
+
+/// Inverse of a canonical nonzero residue by binary extended gcd:
+/// shift-and-subtract only, no multiplies, so it prices as plain ALU work
+/// on sBPF v3 where a witnessed or modexp inverse is unavailable or costs
+/// bytes. Invariants x1*a == u, x2*a == v (mod p); every outer pass strips
+/// at least one bit from u or v, so 768 passes cover 2x384 bits and the
+/// cap is unreachable for valid inputs (p prime, 0 < a < p).
+pub(crate) fn inv_xgcd(a: &Fp) -> Result<Fp, ProgramError> {
+    if is_zero(a) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut u = *a;
+    let mut v = MODULUS;
+    let mut x1 = ONE;
+    let mut x2 = [0u64; 6];
+    for _ in 0..768 {
+        if is_one(&u) {
+            return Ok(x1);
+        }
+        if is_one(&v) {
+            return Ok(x2);
+        }
+        while u[0] & 1 == 0 {
+            u = shr1(&u);
+            x1 = half_mod(&x1);
+        }
+        while v[0] & 1 == 0 {
+            v = shr1(&v);
+            x2 = half_mod(&x2);
+        }
+        if geq(&u, &v) {
+            u = sub_nocheck(&u, &v);
+            x1 = sub_mod(&x1, &x2);
+        } else {
+            v = sub_nocheck(&v, &u);
+            x2 = sub_mod(&x2, &x1);
+        }
+    }
+    Err(ProgramError::InvalidInstructionData)
+}
+
 pub(crate) fn wit48(bytes: &[u8]) -> Result<Fp, ProgramError> {
     let arr: &[u8; 48] = bytes
         .try_into()

@@ -12,10 +12,11 @@ use solana_program_error::ProgramError;
 use alloc::vec::Vec;
 
 use crate::fp2::*;
-use crate::fp::{split_witness, 
-    add_mod, be_to_limbs, limbs_to_be, mont_mul, neg_mod, sub_mod, sys,
-    to_mont, Fp,
+use crate::fp::{split_witness,
+    add_mod, add_unreduced, be_to_limbs, from_mont, inv_xgcd, limbs_to_be,
+    mont_mul, mont_sqr, neg_mod, sub_mod, sys, to_mont, wit48, Fp,
 };
+use crate::g1::check_inverse;
 use crate::consts_g2::{
     C256_MONT, ISO3A_XDEN, ISO3A_XNUM, ISO3A_YDEN, ISO3A_YNUM,
     PSI2_X_C0, PSI_X_C1, PSI_Y,
@@ -99,8 +100,14 @@ fn hash_to_field_g2(dst: &[u8], msg: &[u8]) -> [Elem2; 2] {
 }
 
 pub(crate) fn gx2_at(x: &Fp2) -> Fp2 {
-    // x^3 + A x + B, with A of the form (0, a)
-    let x3 = mul2(&sq2(x), x);
+    gx2_at_with_sq(x, &sq2(x))
+}
+
+/// x^3 + A x + B (A of the form (0, a)) given xsq = x^2, so callers that
+/// already hold the square skip recomputing it.
+#[inline(always)]
+pub(crate) fn gx2_at_with_sq(x: &Fp2, xsq: &Fp2) -> Fp2 {
+    let x3 = mul2(xsq, x);
     let ax = mul_by_a2i(x);
     add2(&add2(&x3, &ax), &fp2(&SSWU2_ELLP_B))
 }
@@ -245,27 +252,40 @@ fn horner2(coeffs: &[[[u64; 6]; 2]], x: &Fp2) -> Fp2 {
     acc
 }
 
+/// Multiply by 12 with an addition chain.
+#[inline(always)]
+fn m12(a: &Fp) -> Fp {
+    let a2 = add_mod(a, a);
+    let a4 = add_mod(&a2, &a2);
+    add_mod(&add_mod(&a4, &a4), &a4)
+}
+
+/// One adapted cubic (x + g)(x^2 + q1) + q0 at x with xsq = x^2; the sums
+/// ride unreduced, every one a mul2 operand or checked via mul2.
+#[inline(always)]
+fn iso3_cubic(x: &Fp2, xsq: &Fp2, k: &[[[u64; 6]; 2]]) -> Fp2 {
+    add2_unreduced(
+        &mul2(&add2_unreduced(x, &fp2(&k[0])), &add2_unreduced(xsq, &fp2(&k[1]))),
+        &fp2(&k[2]),
+    )
+}
+
+/// The iso-3 numerator pair at x given xsq = x^2: the adapted cubics times
+/// their leading coefficients.
+#[inline(always)]
+fn iso3_numerators(x: &Fp2, xsq: &Fp2) -> (Fp2, Fp2) {
+    let x_num = mul2(&iso3_cubic(x, xsq, &ISO3A_XNUM), &fp2(&ISO3A_XNUM[3]));
+    let y_num = mul2(&iso3_cubic(x, xsq, &ISO3A_YNUM), &fp2(&ISO3A_YNUM[3]));
+    (x_num, y_num)
+}
+
 /// Adapted iso-3 evaluation: cubics as (y + g)(w + q1) + q0, the degree-2
 /// denominator via its tiny coefficients (12 - 12i, -72i) as adds. Five
 /// Fp2 multiplications plus one squaring against eleven for Horner.
 pub(crate) fn iso3_adapted(x: &Fp2) -> (Fp2, Fp2, Fp2, Fp2) {
-    fn m12(a: &Fp) -> Fp {
-        let a2 = add_mod(a, a);
-        let a4 = add_mod(&a2, &a2);
-        add_mod(&add_mod(&a4, &a4), &a4)
-    }
     let w = sq2(x);
-
-    // sums ride unreduced: every one is a mul2 operand or checked via mul2
-    let cubic = |k: &[[[u64; 6]; 2]]| {
-        add2_unreduced(
-            &mul2(&add2_unreduced(x, &fp2(&k[0])), &add2_unreduced(&w, &fp2(&k[1]))),
-            &fp2(&k[2]),
-        )
-    };
-    let x_num = mul2(&cubic(&ISO3A_XNUM), &fp2(&ISO3A_XNUM[3]));
-    let y_num = mul2(&cubic(&ISO3A_YNUM), &fp2(&ISO3A_YNUM[3]));
-    let y_den = cubic(&ISO3A_YDEN);
+    let (x_num, y_num) = iso3_numerators(x, &w);
+    let y_den = iso3_cubic(x, &w, &ISO3A_YDEN);
     // x_den = w + (12 - 12i) x + k0
     let k1x = Fp2 {
         c0: m12(&add_mod(&x.c0, &x.c1)),
@@ -500,13 +520,248 @@ pub fn hash_to_g2_prefix(dst: &[u8], stage: u8, payload: &[u8]) -> Result<Vec<u8
     Ok(cleared.to_vec())
 }
 
+// ---------------------------------------------------------------------------
+// Compact witness: 145 bytes against the default blob's 578.
+//
+// blob: flags (two branch bits), c0(y0), c0(y1), w
+//
+// Two ideas shrink the blob. A square root over Fp2 travels as its real
+// part alone: with gx = g0 + g1 i and y = c0 + c1 i, the imaginary half of
+// y^2 == gx forces c1 = g1 / (2 c0), so shipping c0 and checking the real
+// half (c0^2 - c1^2 == g0) pins the root. And every inverse the pipeline
+// needs -- the two tv2 inverses, the two 2c0 divisors, and per map the
+// iso-3 denominator pair -- collapses into one Montgomery batch: the blob
+// carries a single Fp witness w = (e1 ... e8)^-1 whose product check pins
+// every unpacked inverse. Fp2 inverses ride their norms (inv z =
+// conj z / norm z, and norm z = 0 only at z = 0 since -1 is a non-residue),
+// so the batch stays in Fp.
+//
+// The iso-3 denominators must join the batch before any inverse exists, so
+// they are evaluated homogenized over the fractional SSWU candidate
+// x' = n / tv2 (xden_h = tv2^2 xden(x'), yden_h = tv2^3 yden(x')); the
+// numerators wait for the affine x'. Each map then lands on E on its own
+// and the E-side addition rides the g2 add syscall instead of a slope
+// witness, which also drops the equal-x abort of the witnessed E' add.
+//
+// Steering room: none. w is pinned by the product check; c0 by the
+// real-part check, and both roots of gx collapse to one output through the
+// sign rule as before; a lied branch flag either changes the batch elements
+// out from under w or leaves the real-part check unsatisfiable (the
+// wrong branch's gx is a non-square by the SSWU non-residue construction).
+// A zero anywhere (u = 0, iso poles, a zero denominator) zeroes the batch
+// product and aborts. Like the rest of the pipeline this trades the RFC's
+// exceptional cases for aborts on measure-zero inputs; the one new case is
+// gx square with a purely imaginary root (c0 = 0), which cannot be encoded.
+
+const C_TOTAL: usize = 1 + 3 * 48;
+// witness-free-inverse layout: the compact blob minus its trailing w
+const C_XGCD_TOTAL: usize = 1 + 2 * 48;
+
+pub(crate) fn norm_fp2(z: &Fp2) -> Fp {
+    add_mod(&mont_sqr(&z.c0), &mont_sqr(&z.c1))
+}
+
+/// Replace every element with its inverse in place (all Montgomery form)
+/// through one shared inversion. With a witness the product check pins it
+/// (one multiply); without one the product is inverted in-program by
+/// binary xgcd, trading the 48 witness bytes for shift-and-subtract CU.
+/// Any zero element zeroes the product and fails either path.
+/// inline(never): the prefix table lives in its own SBF frame.
+#[inline(never)]
+fn batch_inverse<const N: usize>(elems: &mut [Fp; N], w: Option<&Fp>) -> Result<(), ProgramError> {
+    let mut prefix = [ZERO; N];
+    prefix[0] = elems[0];
+    for i in 1..N {
+        prefix[i] = mont_mul(&prefix[i - 1], &elems[i]);
+    }
+    let w = match w {
+        Some(w) => check_inverse(&prefix[N - 1], w)?,
+        None => to_mont(&inv_xgcd(&from_mont(&prefix[N - 1]))?),
+    };
+    let mut acc = w;
+    for i in (1..N).rev() {
+        let e = elems[i];
+        elems[i] = mont_mul(&acc, &prefix[i - 1]);
+        acc = mont_mul(&acc, &e);
+    }
+    elems[0] = acc;
+    Ok(())
+}
+
+/// Fp2 inverse assembled from the batched inverse of its norm. Negation
+/// follows the multiply so unreduced components are legal inputs.
+fn inv2_from_norm(z: &Fp2, norm_inv: &Fp) -> Fp2 {
+    Fp2 {
+        c0: mont_mul(&z.c0, norm_inv),
+        c1: neg_mod(&mont_mul(&z.c1, norm_inv)),
+    }
+}
+
+/// Per-map values both compact paths derive before any inverse exists: the
+/// fractional SSWU candidate numerator (denominator tv2) and the iso-3
+/// denominators evaluated homogenized over it (xden_h = tv2^2 xden(x'),
+/// yden_h = tv2^3 yden(x')), so their norms can join the batch. Shared by
+/// the verifier and the host generator: the batch layout is defined once.
+struct MapParts {
+    n: Fp2,
+    dsq: Fp2,
+    dcb: Fp2,
+    xden_h: Fp2,
+    yden_h: Fp2,
+}
+
+/// inline(never): the intermediates live in their own SBF frame.
+#[inline(never)]
+fn compact_map_parts(pre: &SswuPre, flag: u8) -> MapParts {
+    let mut n = mul2(&fp2(&SSWU2_C1_NEG_B_OVER_A), &add2_unreduced(&pre.tv2, &ONE2));
+    if flag == 1 {
+        n = mul2(&pre.xi_usq, &n);
+    }
+    let d = &pre.tv2;
+    let dsq = sq2(d);
+    let dcb = mul2(&dsq, d);
+    let nsq = sq2(&n);
+    let nd = mul2(&n, d);
+    // sums ride unreduced: they feed mont_sqr norms and inv2_from_norm
+    // xden_h = n^2 + (12 - 12i) n d + k0 d^2
+    let k1nd = Fp2 {
+        c0: m12(&add_mod(&nd.c0, &nd.c1)),
+        c1: m12(&sub_mod(&nd.c1, &nd.c0)),
+    };
+    let xden_h = add2_unreduced(&add2_unreduced(&nsq, &k1nd), &mul2(&fp2(&ISO3A_XDEN[1]), &dsq));
+    // the adapted monic cubic (x + g)(x^2 + q1) + q0, homogenized
+    let yden_h = add2_unreduced(
+        &mul2(
+            &add2_unreduced(&n, &mul2(&fp2(&ISO3A_YDEN[0]), d)),
+            &add2_unreduced(&nsq, &mul2(&fp2(&ISO3A_YDEN[1]), &dsq)),
+        ),
+        &mul2(&fp2(&ISO3A_YDEN[2]), &dcb),
+    );
+    MapParts { n, dsq, dcb, xden_h, yden_h }
+}
+
+/// The per-map denominators after batch unpacking, bundled for the tail.
+struct IsoDen<'a> {
+    dsq: &'a Fp2,
+    dcb: &'a Fp2,
+    inv_xden: Fp2,
+    inv_yden: Fp2,
+}
+
+/// One map's tail: recover the sqrt from its real part, fix the sign, and
+/// land the point on E through the iso with pre-inverted denominators.
+#[inline(never)]
+fn sswu_iso_compact(
+    u: &Elem2,
+    x: &Fp2,
+    flag: u8,
+    c0: &Fp,
+    inv_2c0: &Fp,
+    den: &IsoDen,
+) -> Result<[u8; POINT], ProgramError> {
+    let xsq = sq2(x);
+    let gx = gx2_at_with_sq(x, &xsq);
+    // gx == 0 forces both branches to zero; blst takes x1, so the x2 branch
+    // is rejected (its c0 = 0 case aborts in the batch before this)
+    if flag == 1 && is_zero2(&gx) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    // c1 = g1 / (2 c0) satisfies the imaginary half of y^2 == gx by
+    // construction; the real half, as a difference of squares, is the
+    // remaining unique-answer check
+    let c1 = mont_mul(&gx.c1, inv_2c0);
+    if mont_mul(&add_unreduced(c0, &c1), &sub_mod(c0, &c1)) != gx.c0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let y_m = Fp2 { c0: *c0, c1 };
+    // c0 != 0 (its double is a batch element), so sgn0(y) is c0's parity
+    let y = if (from_mont(c0)[0] & 1 == 1) != sgn0_fp2(&u.canonical) {
+        neg2(&y_m)
+    } else {
+        y_m
+    };
+
+    // numerators only: the denominators arrived through the batch
+    let (x_num, y_num) = iso3_numerators(x, &xsq);
+    let x_out = mul2(&mul2(&x_num, den.dsq), &den.inv_xden);
+    let y_out = mul2(&mul2(&mul2(&y, &y_num), den.dcb), &den.inv_yden);
+    Ok(point_bytes(&from_mont2(&x_out), &from_mont2(&y_out)))
+}
+
+/// hash_to_g2 against the 145-byte compact blob; same suite, same output
+/// bytes, roughly the CU of the default path plus the traded inversions.
+pub fn hash_to_g2_compact(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    let (wits, msg) = split_witness(payload, C_TOTAL)?;
+    let w = wit48(&wits[C_XGCD_TOTAL..C_TOTAL])?;
+    hash_to_g2_compact_inner(dst, msg, wits, Some(&w))
+}
+
+/// hash_to_g2 against the 97-byte blob: flags and the two root halves
+/// only. The batched inverse is computed in-program by binary xgcd
+/// instead of witnessed, trading its 48 bytes for shift-and-subtract CU.
+pub fn hash_to_g2_compact_xgcd(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    let (wits, msg) = split_witness(payload, C_XGCD_TOTAL)?;
+    hash_to_g2_compact_inner(dst, msg, wits, None)
+}
+
+fn hash_to_g2_compact_inner(
+    dst: &[u8],
+    msg: &[u8],
+    wits: &[u8],
+    w: Option<&Fp>,
+) -> Result<Vec<u8>, ProgramError> {
+    let flags = wits[0];
+    if flags > 3 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let c0s = [wit48(&wits[1..49])?, wit48(&wits[49..97])?];
+
+    let u = hash_to_field_g2(dst, msg);
+    let pre = [sswu_pre(&u[0])?, sswu_pre(&u[1])?];
+    let parts = [
+        compact_map_parts(&pre[0], flags & 1),
+        compact_map_parts(&pre[1], (flags >> 1) & 1),
+    ];
+
+    // after the in-place batch these hold the inverses, element for element
+    let mut inv = [
+        add_unreduced(&c0s[0], &c0s[0]),
+        add_unreduced(&c0s[1], &c0s[1]),
+        norm_fp2(&pre[0].tv2),
+        norm_fp2(&pre[1].tv2),
+        norm_fp2(&parts[0].xden_h),
+        norm_fp2(&parts[0].yden_h),
+        norm_fp2(&parts[1].xden_h),
+        norm_fp2(&parts[1].yden_h),
+    ];
+    batch_inverse(&mut inv, w)?;
+
+    let mut points = [[0u8; POINT]; 2];
+    for i in 0..2 {
+        let x = mul2(&parts[i].n, &inv2_from_norm(&pre[i].tv2, &inv[2 + i]));
+        let den = IsoDen {
+            dsq: &parts[i].dsq,
+            dcb: &parts[i].dcb,
+            inv_xden: inv2_from_norm(&parts[i].xden_h, &inv[4 + 2 * i]),
+            inv_yden: inv2_from_norm(&parts[i].yden_h, &inv[5 + 2 * i]),
+        };
+        points[i] = sswu_iso_compact(&u[i], &x, (flags >> i) & 1, &c0s[i], &inv[i], &den)?;
+    }
+
+    let sum = g2_add(&points[0], &points[1])?;
+    let cleared = clear_cofactor(&sum)?;
+    g2_validate(&cleared)?;
+    Ok(cleared.to_vec())
+}
+
 /// Host-side witness generation mirroring the on-chain pipeline.
 #[cfg(not(target_os = "solana"))]
 pub mod witness {
     use super::*;
     use crate::consts_g1::R;
     use crate::consts_g2::{ISO3_XDEN, ISO3_XNUM, ISO3_YDEN, ISO3_YNUM};
-    use crate::fp::{add_carryless, exp_inverse, exp_legendre, exp_sqrt, is_zero, shr1};
+    use crate::fp::{exp_inverse, exp_legendre, exp_sqrt, half_mod, is_zero};
     use alloc::vec;
 
     fn pow_mont(base: &Fp, exp_be: &[u8; 48]) -> Fp {
@@ -543,21 +798,8 @@ pub mod witness {
         s
     }
 
-    /// Halve a residue: works in any representation.
-    fn half(a: &Fp) -> Fp {
-        if a[0] & 1 == 0 {
-            shr1(a)
-        } else {
-            shr1(&add_carryless(a))
-        }
-    }
-
-    fn norm(z: &Fp2) -> Fp {
-        add_mod(&mont_mul(&z.c0, &z.c0), &mont_mul(&z.c1, &z.c1))
-    }
-
     pub(crate) fn inv2(z: &Fp2) -> Fp2 {
-        let n_inv = inv_fp(&norm(z));
+        let n_inv = inv_fp(&norm_fp2(z));
         Fp2 {
             c0: mont_mul(&z.c0, &n_inv),
             c1: mont_mul(&neg_mod(&z.c1), &n_inv),
@@ -565,7 +807,7 @@ pub mod witness {
     }
 
     pub(crate) fn is_square2(z: &Fp2) -> bool {
-        is_square_fp(&norm(z))
+        is_square_fp(&norm_fp2(z))
     }
 
     /// Square root in Fp2 via the norm trick; input must be a square.
@@ -576,10 +818,10 @@ pub mod witness {
             }
             return Fp2 { c0: ZERO, c1: sqrt_fp(&neg_mod(&z.c0)) };
         }
-        let delta = sqrt_fp(&norm(z));
-        let mut t = half(&add_mod(&z.c0, &delta));
+        let delta = sqrt_fp(&norm_fp2(z));
+        let mut t = half_mod(&add_mod(&z.c0, &delta));
         if !is_square_fp(&t) {
-            t = half(&sub_mod(&z.c0, &delta));
+            t = half_mod(&sub_mod(&z.c0, &delta));
         }
         let x = sqrt_fp(&t);
         let y = mont_mul(&z.c1, &inv_fp(&add_mod(&x, &x)));
@@ -610,19 +852,25 @@ pub mod witness {
         out
     }
 
+    /// SSWU branch selection at the affine candidate: x1 when gx1 is a
+    /// square, else x2 = xi u^2 x1.
+    fn select_sswu_branch(pre: &SswuPre, inv_tv2: &Fp2) -> (u8, Fp2, Fp2) {
+        let x1 = mul2(&fp2(&SSWU2_C1_NEG_B_OVER_A), &add2(&ONE2, inv_tv2));
+        let gx1 = gx2_at(&x1);
+        if is_square2(&gx1) {
+            (0, x1, gx1)
+        } else {
+            let x2 = mul2(&pre.xi_usq, &x1);
+            let gx2 = gx2_at(&x2);
+            (1, x2, gx2)
+        }
+    }
+
     pub fn generate_nu(msg: &[u8]) -> Vec<u8> {
         let u = hash_to_field_nu(crate::dst::G2_NU, msg);
         let pre = sswu_pre(&u).unwrap();
         let w_tv2 = inv2(&pre.tv2);
-        let x1 = mul2(&fp2(&SSWU2_C1_NEG_B_OVER_A), &add2(&ONE2, &w_tv2));
-        let gx1 = gx2_at(&x1);
-        let (flag, x, gx) = if is_square2(&gx1) {
-            (0u8, x1, gx1)
-        } else {
-            let x2 = mul2(&pre.xi_usq, &x1);
-            let g = gx2_at(&x2);
-            (1u8, x2, g)
-        };
+        let (flag, x, gx) = select_sswu_branch(&pre, &w_tv2);
         let y = sqrt2(&gx);
         let mut y_canonical = from_mont2(&y);
         if sgn0_fp2(&y_canonical) != sgn0_fp2(&u.canonical) {
@@ -663,15 +911,7 @@ pub mod witness {
         let mut ys = [Fp2 { c0: ZERO, c1: ZERO }; 2];
         let mut points = Vec::new();
         for i in 0..2 {
-            let x1 = mul2(&fp2(&SSWU2_C1_NEG_B_OVER_A), &add2(&ONE2, &invs[i]));
-            let gx1 = gx2_at(&x1);
-            let (flag, x, gx) = if is_square2(&gx1) {
-                (0u8, x1, gx1)
-            } else {
-                let x2 = mul2(&pre[i].xi_usq, &x1);
-                let gx2 = gx2_at(&x2);
-                (1u8, x2, gx2)
-            };
+            let (flag, x, gx) = select_sswu_branch(&pre[i], &invs[i]);
             let y = sqrt2(&gx);
 
             let mut y_canonical = from_mont2(&y);
@@ -708,5 +948,86 @@ pub mod witness {
 
         assert_eq!(blob.len(), W_TOTAL);
         blob
+    }
+
+    /// The 97-byte prefix (flags and the two root halves) plus the batch
+    /// product, so each layout pays only for what it ships. The batch
+    /// elements mirror compact_map_parts, which the verifier also uses.
+    fn generate_compact_prefix(msg: &[u8], steer_flags: u8) -> (Vec<u8>, Fp) {
+        let u = hash_to_field_g2(crate::dst::G2_RO, msg);
+        let pre = [sswu_pre(&u[0]).unwrap(), sswu_pre(&u[1]).unwrap()];
+
+        let mut flags = 0u8;
+        let mut blob = Vec::with_capacity(C_TOTAL);
+        blob.push(0);
+        let mut prod = R;
+        for i in 0..2 {
+            let (mut flag, _, gx) = select_sswu_branch(&pre[i], &inv2(&pre[i].tv2));
+            let y = sqrt2(&gx);
+            assert!(
+                !is_zero(&y.c0),
+                "measure-zero input: the root's real part is zero, \
+                 which the compact blob cannot encode"
+            );
+            // test-only steering: lie about the branch while keeping the
+            // batch self-consistent with the lie
+            flag ^= (steer_flags >> i) & 1;
+            flags |= flag << i;
+            blob.extend_from_slice(&limbs_to_be(&y.c0));
+
+            // the product is order-independent, so just fold the four
+            // per-map batch elements in as they appear
+            let parts = compact_map_parts(&pre[i], flag);
+            prod = mont_mul(&prod, &add_mod(&y.c0, &y.c0));
+            prod = mont_mul(&prod, &norm_fp2(&pre[i].tv2));
+            prod = mont_mul(&prod, &norm_fp2(&parts.xden_h));
+            prod = mont_mul(&prod, &norm_fp2(&parts.yden_h));
+        }
+        blob[0] = flags;
+        (blob, prod)
+    }
+
+    /// The 145-byte compact blob: flags, the two roots' real parts, one
+    /// batched inverse.
+    pub fn generate_compact(msg: &[u8]) -> Vec<u8> {
+        generate_compact_steered(msg, 0)
+    }
+
+    /// The 97-byte witness-free-inverse blob: the compact blob minus its
+    /// batched-inverse tail (the program recomputes that by binary xgcd).
+    pub fn generate_compact_xgcd(msg: &[u8]) -> Vec<u8> {
+        generate_compact_prefix(msg, 0).0
+    }
+
+    /// The other square root for the first map: an equally valid witness
+    /// that must not steer. Negating c0 negates one batch factor, so the
+    /// trailing inverse (when the layout carries it) negates with it.
+    pub fn flip_first_root(blob: &[u8]) -> Vec<u8> {
+        assert!(blob.len() == C_TOTAL || blob.len() == C_XGCD_TOTAL);
+        let mut out = blob.to_vec();
+        for range in [1..49, C_XGCD_TOTAL..C_TOTAL] {
+            if range.end > blob.len() {
+                break;
+            }
+            let flipped = neg_mod(&be_to_limbs(blob[range.clone()].try_into().unwrap()));
+            out[range].copy_from_slice(&limbs_to_be(&flipped));
+        }
+        out
+    }
+
+    /// Branch-lie probe: the batch witness stays consistent with the lie,
+    /// but no c0 can satisfy the real-part check against a non-square gx,
+    /// so the program must abort.
+    #[doc(hidden)]
+    pub fn generate_compact_steered(msg: &[u8], steer_flags: u8) -> Vec<u8> {
+        let (mut blob, prod) = generate_compact_prefix(msg, steer_flags);
+        blob.extend_from_slice(&limbs_to_be(&inv_fp(&prod)));
+        blob
+    }
+
+    /// Branch-lie probe, 97-byte layout.
+    #[doc(hidden)]
+    pub fn generate_compact_xgcd_steered(msg: &[u8], steer_flags: u8) -> Vec<u8> {
+        generate_compact_prefix(msg, steer_flags).0
     }
 }

@@ -79,10 +79,6 @@ struct PointPrime {
     y: Fp,
 }
 
-fn is_one_canonical(a: &Fp) -> bool {
-    a[0] == 1 && a[1..].iter().all(|&l| l == 0)
-}
-
 /// xi = 11: multiply by the SSWU non-residue with an addition chain.
 pub(crate) fn mul_by_xi(a: &Fp) -> Fp {
     let a2 = add_mod(a, a);
@@ -117,7 +113,7 @@ fn map_to_curve_sswu(u: &Fp, c_neg_b_over_a: &Fp, exps: &Exps) -> Result<PointPr
     let legendre = modexp(&from_mont(&gx1), &exps.legendre)?;
 
     // is_square(0) is true, so gx1 == 0 takes the x1 branch to match blst.
-    let (x, gx_val) = if is_zero(&gx1) || is_one_canonical(&legendre) {
+    let (x, gx_val) = if is_zero(&gx1) || is_one(&legendre) {
         (x1, gx1)
     } else {
         let x2 = mont_mul(&xi_usq, &x1);

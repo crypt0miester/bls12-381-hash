@@ -4,24 +4,35 @@ Measured with mollusk 0.13.4 on the agave 4.0 stack, SBF v3, against the
 `program/` fixture; the bench suite asserts byte-equality with blst at every
 stage.
 
+Known issue (2026-07-13): the naive zkcrypto reference rows (tags 0/1)
+produce wrong points on the current platform-tools; both naive tests fail,
+silently and at plausible CU, and their historical numbers (11.3M G1 /
+46.5M G2) date from the earlier toolchain. Suspected u128 miscompilation;
+the crate's own paths use no u128 anywhere, are unaffected, and stay blst
+byte-verified.
+
 ## Pipelines
 
 | pipeline | CU | witness | compatibility |
 |---|---|---|---|
 | hash_to_G1 (RO, min-sig) | ~129k | 338 B | `_SSWU_RO_POP_`, byte-equal to blst |
 | hash_to_G2 (RO, min-pk) | ~253k | 578 B | `_SSWU_RO_POP_`, byte-equal to blst |
+| hash_to_G2 (RO, compact) | ~470k | 145 B | same suite, same output bytes |
+| hash_to_G2 (RO, xgcd) | ~583k | 97 B | same suite, same output bytes |
 | hash_to_G2 (RO, `wide-witness`) | ~241k | 674 B | same suite, bigger blob |
 | encode_to_G1 (NU) | ~99k | 193 B | `_SSWU_NU_POP_`, byte-equal to blst encode |
 | encode_to_G2 (NU) | ~173k | 385 B | `_SSWU_NU_POP_`, byte-equal to blst encode |
 
-The two G2 rows are the same pipeline with a different tv2 witness layout:
-the default 578 B blob pins both tv2 inverses behind one pair inversion
-witness and keeps a legacy 1,232 B transaction comfortable, while
-`wide-witness` ships both inverses directly (96 more bytes, ~12k CU less)
-for when SIMD-0296 4 KiB transactions land. An end-to-end min-pk BLS verify
-(hash_to_G2 plus the pairing syscall) lands around 309k CU (297k wide). A
-381-bit field multiplication costs ~1.9k CU with the ps30 product-scanning
-multiplier (the textbook 32-bit CIOS form bottoms out around 3.3k).
+The default and `wide-witness` G2 rows are the same pipeline with a
+different tv2 witness layout: the default 578 B blob pins both tv2 inverses
+behind one pair inversion witness, while `wide-witness` ships both inverses
+directly (96 more bytes, ~12k CU less) for when SIMD-0296 4 KiB
+transactions land. The compact and xgcd rows are the byte-bound layouts,
+detailed below. An end-to-end min-pk BLS verify (hash_to_G2 plus the
+pairing syscall) lands around 308k CU (297k wide, 525k compact, 638k xgcd).
+A 381-bit field multiplication costs ~1.9k CU with the ps30
+product-scanning multiplier (the textbook 32-bit CIOS form bottoms out
+around 3.3k).
 
 The NU suites hash with a single map (RFC 9380 encode_to_curve). Note that
 the CFRG BLS signature draft registers only hash_to_curve (RO) ciphersuites,
@@ -33,6 +44,52 @@ suffices for unforgeability. That makes it a deliberate protocol choice, and
 the hash must never be reused for anything that actually needs a random
 oracle.
 
+## Compact witness layouts
+
+Two G2 layouts restructure the same checks to shrink the blob for
+byte-bound transactions (hash tags 48/49, end-to-end verify tags 54/55,
+exact numbers at bench commit of 2026-07-13):
+
+| layout | blob | hash CU | e2e verify k=14 / k=20 |
+|---|---|---|---|
+| default | 578 B | 252,916 | 308,209 / 294,568 |
+| compact | 145 B | 470,108 | 525,373 / 511,756 |
+| xgcd | 97 B | 582,583 | 637,851 / 624,234 |
+
+The compact blob is one flags byte (the two SSWU branch bits), the real
+halves of the two square roots, and one batched inverse witness. A root
+travels as c0 alone: the imaginary half of `y^2 == gx` forces
+`c1 = g1/(2 c0)`, the real half, checked as `(c0 + c1)(c0 - c1) == g0`,
+pins it, and both roots collapse to one output through the sgn0 rule (the
+sign read is c0's parity, since a zero c0 cannot pass the batch). Every
+inverse the pipeline needs, the 2c0 divisors, the tv2 pair, and the
+per-map iso-3 denominators, hides behind `w = (e1..e8)^-1` with one
+product check; Fp2 inverses ride their norms (`norm z = 0` only at
+`z = 0` since -1 is a non-residue), so a zero anywhere fails the product.
+The iso-3 denominators join the batch before any inverse exists by
+evaluating them homogenized over the fractional candidate `x' = n/tv2`
+(`compact_map_parts`, shared verbatim by the verifier and the host
+generator so the batch layout is defined once), each map lands on E on
+its own, and the E-side addition rides the g2 add syscall instead of a
+slope witness.
+
+The xgcd layout drops the last witness: inversion is gcd-shaped, so the
+batch product is inverted in-program by binary extended gcd
+(`fp.rs::inv_xgcd`, shift-and-subtract only, no multiplies, a 768-pass
+cap; ~112k CU, mildly message-dependent). Square roots have no
+multiply-free algorithm, so the two c0 halves are the transported floor,
+97 B with the flags byte. A branch lie either desyncs the batch from `w`
+or leaves the real-part check unsatisfiable (the wrong branch's gx is a
+non-square); the soundness sweeps cover both layouts bit by bit,
+including batch-consistent lies (`generate_compact_*_steered`) and the
+other square root (`flip_first_root`, which also negates the trailing
+inverse when the layout carries one).
+
+Two measure-zero deviations beyond the pipeline's existing aborts: a gx
+that is zero on the x1 branch, and a root with zero real part, both abort
+instead of hashing (probability ~2^-380, unreachable for SHA-derived
+inputs).
+
 ## Stage costs
 
 Tags 46/47, cumulative prefixes of the witnessed pipelines:
@@ -41,7 +98,7 @@ Tags 46/47, cumulative prefixes of the witnessed pipelines:
 |---|---|---|
 | hash_to_field | 9.7k | 19.7k |
 | both SSWU maps | 34.4k | 100.1k |
-| E' add + isogeny | 69.7k | 78.5k |
+| E' add + isogeny | 69.7k | 78.0k |
 | clear_cofactor + validate | 14.9k | 55.1k |
 
 The isogeny evaluation dominates the field work (soundness requires
@@ -102,6 +159,17 @@ shortcut it), and the clearing stages are syscall pricing.
   riding in the payload (96 fewer transaction bytes), and the GT identity
   compare uses the memcmp syscall (10 CU) instead of an inline 576 byte
   loop.
+- The compact layouts (2026-07-13, tags 48/49/54/55): half-width square
+  roots recovered through the curve equation, a single batched inverse for
+  the whole pipeline, homogenized iso-3 denominators so the batch closes
+  before any inverse exists, per-map iso with the E-side addition through
+  the g2 add syscall, and an in-program binary-xgcd inverse replacing the
+  batch witness in the 97 B layout. The real-part check runs as a
+  difference of squares (one mont_mul against two mont_sqr) and the sign
+  read is c0's parity (one from_mont against a full from_mont2). Extracting
+  the shared iso-3 numerator and gx helpers moved the default G2 path
+  253,404 to 252,916 (-489, better inlining); tag 51 followed to 308,209 at
+  k=14.
 
 ## Measured dead ends
 
@@ -125,12 +193,22 @@ Open knobs, in rough order of interest:
 - The modexp path (tags 30 to 33) runs hash_to_G1 in ~168k CU with zero
   witness bytes, against ~129k plus 338 B for the witnessed path. It needs
   `big_mod_exp` (SIMD-0529, merged but not active). Once 0529 activates, a
-  transaction that is byte-bound rather than CU-bound should prefer it.
-- The min-pk verify transaction is closer to byte-bound than CU-bound (309k
-  of the 1.4M CU ceiling, but witness plus keys eat real transaction space).
-  The byte/CU frontier is the `wide-witness` feature; SIMD-0296 (4 KiB
-  transactions, SDK support already merged) dissolves the byte constraint
-  entirely when it activates.
+  transaction that is byte-bound rather than CU-bound should prefer it, and
+  the compact G2 shape goes zero-witness too: the host `sqrt2` construction
+  (an Fp2 root from three Fp modexps plus an inverse, the norm trick) runs
+  through the syscall at ~1.7k CU per call, the branch decisions become
+  Legendre modexps, and the ~112k xgcd inversion collapses to one modexp.
+- The min-pk verify transaction is byte-bound, not CU-bound (308k to 638k
+  of the 1.4M CU ceiling, but witness plus keys eat real transaction
+  space). The byte/CU frontier is now the layout choice: 578 B at ~253k,
+  145 B at ~470k, 97 B at ~583k, with `wide-witness` (674 B, ~241k) as the
+  CU end once SIMD-0296 (4 KiB transactions, SDK support already merged)
+  dissolves the byte constraint.
+- `inv_xgcd` is deliberately naive: u and v stay full six-limb for the
+  whole run, trailing-zero runs strip one bit per pass, and the odd-case
+  halving materializes its add before shifting. Active-limb tracking plus
+  a trailing-zeros batch is worth maybe 25-35k of its ~112k, at the cost
+  of length-parameterized limb helpers in consensus-adjacent code.
 - G2 cofactor clearing costs ~55k CU: roughly ~45k across ~140 g2 add syscalls
   and ~10k of psi/psi2 Fp2 multiplication. The Budroni-Pintore chain is the best
   known construction, so the syscall share is pricing rather than structure, but

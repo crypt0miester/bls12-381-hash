@@ -44,6 +44,7 @@ fn cu(mollusk: &Mollusk, tag: u8, payload: &[u8], label: &str) -> u64 {
 }
 
 #[test]
+#[ignore = "naive zkcrypto rows miscompile on current platform-tools, see BENCHMARKS.md"]
 fn bench_hash_to_curve_pipeline() {
     let mollusk = mollusk();
 
@@ -90,6 +91,7 @@ fn bench_hash_to_curve_pipeline() {
 }
 
 #[test]
+#[ignore = "naive zkcrypto rows miscompile on current platform-tools, see BENCHMARKS.md"]
 fn bench_hash_to_g2_matches_blst() {
     let mollusk = mollusk();
     let result = run(&mollusk, 0, MESSAGE);
@@ -502,6 +504,178 @@ fn bench_witness_hash_to_g2() {
     assert!(rejected.program_result.is_err(), "corrupt witness was accepted");
 }
 
+fn blst_hash_g2_serialized(msg: &[u8]) -> [u8; 192] {
+    let mut point = blst::blst_p2::default();
+    let mut serialized = [0u8; 192];
+    unsafe {
+        blst::blst_hash_to_g2(
+            &mut point,
+            msg.as_ptr(),
+            msg.len(),
+            DST_G2.as_ptr(),
+            DST_G2.len(),
+            std::ptr::null(),
+            0,
+        );
+        blst::blst_p2_serialize(serialized.as_mut_ptr(), &point);
+    }
+    serialized
+}
+
+#[test]
+fn bench_witness_hash_to_g2_compact() {
+    let mollusk = mollusk();
+
+    let witnesses = bls381_hash::witness::g2::generate_compact(MESSAGE);
+    let mut payload = witnesses.clone();
+    payload.extend_from_slice(MESSAGE);
+
+    let result = run(&mollusk, 48, &payload);
+    assert!(
+        !result.program_result.is_err(),
+        "compact hash_to_g2 failed: {:?}",
+        result.program_result
+    );
+    assert_eq!(result.return_data, blst_hash_g2_serialized(MESSAGE).to_vec(), "differs from blst");
+
+    // and byte-identical to the default witnessed path
+    let fat = bls381_hash::witness::g2::generate(MESSAGE);
+    let mut fat_payload = fat.clone();
+    fat_payload.extend_from_slice(MESSAGE);
+    let fat_result = run(&mollusk, 41, &fat_payload);
+    assert_eq!(result.return_data, fat_result.return_data, "compact and default paths disagree");
+
+    println!(
+        "compact witness-assisted hash_to_G2: {} CU ({} witness bytes)",
+        result.compute_units_consumed,
+        witnesses.len()
+    );
+
+    let mut bad = payload.clone();
+    bad[100] ^= 1;
+    let rejected = run(&mollusk, 48, &bad);
+    assert!(rejected.program_result.is_err(), "corrupt compact witness was accepted");
+}
+
+#[test]
+fn bench_witness_hash_to_g2_compact_xgcd() {
+    let mollusk = mollusk();
+
+    let witnesses = bls381_hash::witness::g2::generate_compact_xgcd(MESSAGE);
+    assert_eq!(witnesses.len(), 97);
+    let mut payload = witnesses.clone();
+    payload.extend_from_slice(MESSAGE);
+
+    let result = run(&mollusk, 49, &payload);
+    assert!(
+        !result.program_result.is_err(),
+        "xgcd hash_to_g2 failed: {:?}",
+        result.program_result
+    );
+    assert_eq!(result.return_data, blst_hash_g2_serialized(MESSAGE).to_vec(), "differs from blst");
+
+    println!(
+        "xgcd witness-assisted hash_to_G2: {} CU ({} witness bytes)",
+        result.compute_units_consumed,
+        witnesses.len()
+    );
+
+    let mut bad = payload.clone();
+    bad[60] ^= 1;
+    let rejected = run(&mollusk, 49, &bad);
+    assert!(rejected.program_result.is_err(), "corrupt xgcd witness was accepted");
+}
+
+// The compact-blob counterpart of witness_g2_soundness, shared by both
+// layouts: no bit of the blob can steer the output, the flag range is
+// canonical, witnesses are message-bound, the other square root does not
+// steer, and a branch lie with a self-consistent batch still aborts.
+fn compact_soundness_sweep(tag: u8, witness: Vec<u8>, steered: fn(&[u8], u8) -> Vec<u8>) {
+    let mollusk = mollusk();
+
+    let mut payload = witness.clone();
+    payload.extend_from_slice(MESSAGE);
+
+    let good = run(&mollusk, tag, &payload);
+    assert!(!good.program_result.is_err(), "honest witness rejected");
+    let truth = good.return_data.clone();
+
+    for i in 0..witness.len() {
+        let mut bad = payload.clone();
+        bad[i] ^= 1;
+        let r = run(&mollusk, tag, &bad);
+        if !r.program_result.is_err() {
+            assert_eq!(r.return_data, truth, "witness byte {i} steered the output");
+        }
+    }
+    for bit in 1..8 {
+        let mut bad = payload.clone();
+        bad[0] ^= 1 << bit;
+        let r = run(&mollusk, tag, &bad);
+        if !r.program_result.is_err() {
+            assert_eq!(r.return_data, truth, "flag bit {bit} steered the output");
+        }
+    }
+
+    // non-canonical flags byte
+    let mut bad = payload.clone();
+    bad[0] = 4;
+    assert!(run(&mollusk, tag, &bad).program_result.is_err(), "flags=4 accepted");
+
+    // a witness limb at or above the modulus must be rejected by the parser
+    for start in (1..witness.len()).step_by(48) {
+        let mut oob = payload.clone();
+        for byte in oob[start..start + 48].iter_mut() {
+            *byte = 0xff;
+        }
+        assert!(
+            run(&mollusk, tag, &oob).program_result.is_err(),
+            "out-of-range witness accepted at byte {start}"
+        );
+    }
+
+    // the witness is bound to the message it was generated for
+    let mut replay = witness.clone();
+    replay.extend_from_slice(b"a different snapshot vote payload");
+    assert!(run(&mollusk, tag, &replay).program_result.is_err(), "cross-message replay accepted");
+
+    // the other square root is an equally valid witness and must not steer
+    let mut alt = bls381_hash::witness::g2::flip_first_root(&witness);
+    alt.extend_from_slice(MESSAGE);
+    let same = run(&mollusk, tag, &alt);
+    assert!(!same.program_result.is_err(), "flipped root rejected");
+    assert_eq!(same.return_data, truth, "flipped root changed the point");
+
+    // a branch lie whose batch stays consistent with the lie still has no
+    // satisfiable sqrt check: wrong-branch gx is a non-square
+    for steer in [1u8, 2, 3] {
+        let mut lied = steered(MESSAGE, steer);
+        lied.extend_from_slice(MESSAGE);
+        assert!(
+            run(&mollusk, tag, &lied).program_result.is_err(),
+            "steered branch flags {steer:#04b} accepted"
+        );
+    }
+}
+
+#[test]
+fn witness_g2_compact_soundness() {
+    compact_soundness_sweep(
+        48,
+        bls381_hash::witness::g2::generate_compact(MESSAGE),
+        bls381_hash::witness::g2::generate_compact_steered,
+    );
+}
+
+#[test]
+fn witness_g2_xgcd_soundness() {
+    compact_soundness_sweep(
+        49,
+        bls381_hash::witness::g2::generate_compact_xgcd(MESSAGE),
+        bls381_hash::witness::g2::generate_compact_xgcd_steered,
+    );
+}
+
 // No witness byte can steer the output: every single-bit corruption of the G2
 // witness must abort or reproduce the exact same point. Also covers the branch
 // flag range, canonical-form parsing, and message binding.
@@ -699,5 +873,74 @@ fn bench_min_pk_verify_end_to_end() {
         bad[1 + 96 + 10] ^= 1;
         let rejected = run(&mollusk, 51, &bad);
         assert!(rejected.program_result.is_err(), "forged min-pk verify accepted at k={k}");
+    }
+}
+
+// The same end-to-end min-pk verify against the 145-byte compact witness
+// (tag 54) and the 97-byte witness-free-inverse blob (tag 55).
+#[test]
+fn bench_min_pk_verify_compact_end_to_end() {
+    use blst::min_pk::{AggregatePublicKey, AggregateSignature, PublicKey, SecretKey, Signature};
+
+    let mollusk = mollusk();
+
+    let keys: Vec<SecretKey> = (0..20u8)
+        .map(|i| {
+            let ikm = [i + 1; 32];
+            SecretKey::key_gen(&ikm, &[]).unwrap()
+        })
+        .collect();
+    let pks: Vec<PublicKey> = keys.iter().map(|s| s.sk_to_pk()).collect();
+    let all_refs: Vec<&PublicKey> = pks.iter().collect();
+    let agg_all = AggregatePublicKey::aggregate(&all_refs, false)
+        .unwrap()
+        .to_public_key();
+
+    let witness = bls381_hash::witness::g2::generate_compact(MESSAGE);
+    let witness_xgcd = bls381_hash::witness::g2::generate_compact_xgcd(MESSAGE);
+
+    for k in [14usize, 20] {
+        let sigs: Vec<Signature> = keys[..k]
+            .iter()
+            .map(|s| s.sign(MESSAGE, DST_G2, &[]))
+            .collect();
+        let sig_refs: Vec<&Signature> = sigs.iter().collect();
+        let agg_sig = AggregateSignature::aggregate(&sig_refs, false)
+            .unwrap()
+            .to_signature();
+
+        let mut head = vec![(20 - k) as u8];
+        head.extend_from_slice(&agg_all.serialize());
+        head.extend_from_slice(&agg_sig.compress());
+        for pk in &pks[k..] {
+            head.extend_from_slice(&pk.compress());
+        }
+
+        for (tag, label, wit) in [
+            (54u8, "compact", &witness),
+            (55, "xgcd", &witness_xgcd),
+        ] {
+            let mut payload = head.clone();
+            payload.extend_from_slice(wit);
+            payload.extend_from_slice(MESSAGE);
+
+            let result = run(&mollusk, tag, &payload);
+            assert!(
+                !result.program_result.is_err(),
+                "{label} min-pk verify failed at k={k}: {:?}",
+                result.program_result
+            );
+            println!(
+                "{label} min-pk end-to-end verify k={k}: {} CU ({} witness bytes)",
+                result.compute_units_consumed,
+                wit.len()
+            );
+
+            // tampered signature must fail
+            let mut bad = payload.clone();
+            bad[1 + 96 + 10] ^= 1;
+            let rejected = run(&mollusk, tag, &bad);
+            assert!(rejected.program_result.is_err(), "forged {label} min-pk verify accepted at k={k}");
+        }
     }
 }
