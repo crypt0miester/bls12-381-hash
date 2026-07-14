@@ -1,4 +1,4 @@
-# bls381-hash
+# bls12-381-hash
 
 Witness-assisted RFC 9380 hash-to-curve for BLS12-381, for Solana SBF programs.
 `no_std`, allocation-free on-chain, using only syscalls active on mainnet today,
@@ -38,8 +38,8 @@ let witness = bls381_hash::witness::g2::generate_compact_xgcd(message);
 | `wide-witness` | 674 B G2 blob, ~14k CU cheaper; for 4 KiB (SIMD-0296) transactions |
 | `full` | everything above |
 
-The `lib/` crate is the product; `program/` is an SBF tag-dispatch fixture and
-`bench/` the mollusk benchmark.
+The `lib/` crate (`bls381-hash`) is the product; `program/` is an SBF
+tag-dispatch fixture and `bench/` the mollusk benchmark.
 
 ## Cost
 
