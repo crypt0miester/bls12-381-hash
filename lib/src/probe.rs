@@ -6,8 +6,8 @@
 // involutions), so their numbers are floors, not costs.
 use crate::consts_g1::{R, R2};
 use crate::fp::{
-    add_mod, be_to_limbs, from_mont, limbs_to_be, mont_mul, mont_sqr, neg_mod, sub_mod,
-    to_mont, wit48, Fp,
+    add_mod, be_to_limbs, from_mont, inv_divsteps, limbs_to_be, mont_mul, mont_sqr, neg_mod,
+    sub_mod, to_mont, wit48, Fp,
 };
 use crate::fp2::{add2, from_mont2, mul2, sq2, sub2, to_mont2, wit96, Fp2};
 use crate::g1::{expand_message_xmd, gx_at, iso11_adapted, mul_by_xi};
@@ -120,6 +120,14 @@ pub fn run(id: u8, count: u64) -> u64 {
                 acc = acc.wrapping_add(b[0][0] as u64);
             }
             acc
+        }
+        25 => {
+            // divsteps inverse; alternates a and a^-1, loop-carried
+            let mut a = R;
+            for _ in 0..count {
+                a = inv_divsteps(&a).unwrap();
+            }
+            a[0]
         }
         _ => 0,
     }

@@ -13,9 +13,10 @@ use alloc::vec::Vec;
 
 use crate::fp2::*;
 use crate::fp::{split_witness,
-    add_mod, add_unreduced, be_to_limbs, from_mont, inv_xgcd, limbs_to_be,
+    add_mod, add_unreduced, be_to_limbs, from_mont, inv_divsteps, limbs_to_be,
     mont_mul, mont_sqr, neg_mod, sub_mod, sys, to_mont, wit48, Fp,
 };
+use crate::consts_g1::R3;
 use crate::g1::check_inverse;
 use crate::consts_g2::{
     C256_MONT, ISO3A_XDEN, ISO3A_XNUM, ISO3A_YDEN, ISO3A_YNUM,
@@ -556,6 +557,13 @@ pub fn hash_to_g2_prefix(dst: &[u8], stage: u8, payload: &[u8]) -> Result<Vec<u8
 const C_TOTAL: usize = 1 + 3 * 48;
 // witness-free-inverse layout: the compact blob minus its trailing w
 const C_XGCD_TOTAL: usize = 1 + 2 * 48;
+// parity layout: the two root halves alone. The verifier re-canonicalizes
+// the root sign through sgn0 anyway, so which root ships is a free bit:
+// each branch flag rides its half's parity (bit 0 of the last big-endian
+// byte; wit48 keeps the encoding canonical, and p odd means the two roots
+// differ in it). A parity lie is a branch lie, and the wrong branch's gx
+// is a non-square, so no real-part check can pass.
+const C_PARITY_TOTAL: usize = 2 * 48;
 
 pub(crate) fn norm_fp2(z: &Fp2) -> Fp {
     add_mod(&mont_sqr(&z.c0), &mont_sqr(&z.c1))
@@ -564,7 +572,8 @@ pub(crate) fn norm_fp2(z: &Fp2) -> Fp {
 /// Replace every element with its inverse in place (all Montgomery form)
 /// through one shared inversion. With a witness the product check pins it
 /// (one multiply); without one the product is inverted in-program by
-/// binary xgcd, trading the 48 witness bytes for shift-and-subtract CU.
+/// divsteps, trading the 48 witness bytes for fixed-count ALU work (the
+/// R3 multiply reads the Montgomery product and returns to that domain).
 /// Any zero element zeroes the product and fails either path.
 /// inline(never): the prefix table lives in its own SBF frame.
 #[inline(never)]
@@ -576,7 +585,7 @@ fn batch_inverse<const N: usize>(elems: &mut [Fp; N], w: Option<&Fp>) -> Result<
     }
     let w = match w {
         Some(w) => check_inverse(&prefix[N - 1], w)?,
-        None => to_mont(&inv_xgcd(&from_mont(&prefix[N - 1]))?),
+        None => mont_mul(&inv_divsteps(&prefix[N - 1])?, &R3),
     };
     let mut acc = w;
     for i in (1..N).rev() {
@@ -689,34 +698,49 @@ fn sswu_iso_compact(
     Ok(point_bytes(&from_mont2(&x_out), &from_mont2(&y_out)))
 }
 
+/// Flags byte (two branch bits, canonical range) plus the two root halves.
+fn parse_flagged_roots(wits: &[u8]) -> Result<(u8, [Fp; 2]), ProgramError> {
+    let flags = wits[0];
+    if flags > 3 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok((flags, [wit48(&wits[1..49])?, wit48(&wits[49..97])?]))
+}
+
 /// hash_to_g2 against the 145-byte compact blob; same suite, same output
 /// bytes, roughly the CU of the default path plus the traded inversions.
 pub fn hash_to_g2_compact(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
     let (wits, msg) = split_witness(payload, C_TOTAL)?;
     let w = wit48(&wits[C_XGCD_TOTAL..C_TOTAL])?;
-    hash_to_g2_compact_inner(dst, msg, wits, Some(&w))
+    let (flags, c0s) = parse_flagged_roots(wits)?;
+    hash_to_g2_compact_inner(dst, msg, flags, &c0s, Some(&w))
 }
 
 /// hash_to_g2 against the 97-byte blob: flags and the two root halves
-/// only. The batched inverse is computed in-program by binary xgcd
-/// instead of witnessed, trading its 48 bytes for shift-and-subtract CU.
+/// only. The batched inverse is computed in-program by extended gcd
+/// (divsteps) instead of witnessed, trading its 48 bytes for ALU work.
 pub fn hash_to_g2_compact_xgcd(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
     let (wits, msg) = split_witness(payload, C_XGCD_TOTAL)?;
-    hash_to_g2_compact_inner(dst, msg, wits, None)
+    let (flags, c0s) = parse_flagged_roots(wits)?;
+    hash_to_g2_compact_inner(dst, msg, flags, &c0s, None)
+}
+
+/// hash_to_g2 against the 96-byte blob: the two root halves alone, each
+/// branch flag riding its half's parity (see the layout comment above).
+pub fn hash_to_g2_compact_parity(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    let (wits, msg) = split_witness(payload, C_PARITY_TOTAL)?;
+    let flags = (wits[47] & 1) | ((wits[95] & 1) << 1);
+    let c0s = [wit48(&wits[..48])?, wit48(&wits[48..96])?];
+    hash_to_g2_compact_inner(dst, msg, flags, &c0s, None)
 }
 
 fn hash_to_g2_compact_inner(
     dst: &[u8],
     msg: &[u8],
-    wits: &[u8],
+    flags: u8,
+    c0s: &[Fp; 2],
     w: Option<&Fp>,
 ) -> Result<Vec<u8>, ProgramError> {
-    let flags = wits[0];
-    if flags > 3 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let c0s = [wit48(&wits[1..49])?, wit48(&wits[49..97])?];
-
     let u = hash_to_field_g2(dst, msg);
     let pre = [sswu_pre(&u[0])?, sswu_pre(&u[1])?];
     let parts = [
@@ -950,6 +974,19 @@ pub mod witness {
         blob
     }
 
+    /// One map's branch flag and square root; the compact blobs cannot
+    /// encode a root with zero real part.
+    fn compact_map_root(pre: &SswuPre) -> (u8, Fp2) {
+        let (flag, _, gx) = select_sswu_branch(pre, &inv2(&pre.tv2));
+        let y = sqrt2(&gx);
+        assert!(
+            !is_zero(&y.c0),
+            "measure-zero input: the root's real part is zero, \
+             which the compact blob cannot encode"
+        );
+        (flag, y)
+    }
+
     /// The 97-byte prefix (flags and the two root halves) plus the batch
     /// product, so each layout pays only for what it ships. The batch
     /// elements mirror compact_map_parts, which the verifier also uses.
@@ -962,13 +999,7 @@ pub mod witness {
         blob.push(0);
         let mut prod = R;
         for i in 0..2 {
-            let (mut flag, _, gx) = select_sswu_branch(&pre[i], &inv2(&pre[i].tv2));
-            let y = sqrt2(&gx);
-            assert!(
-                !is_zero(&y.c0),
-                "measure-zero input: the root's real part is zero, \
-                 which the compact blob cannot encode"
-            );
+            let (mut flag, y) = compact_map_root(&pre[i]);
             // test-only steering: lie about the branch while keeping the
             // batch self-consistent with the lie
             flag ^= (steer_flags >> i) & 1;
@@ -994,10 +1025,36 @@ pub mod witness {
     }
 
     /// The 97-byte witness-free-inverse blob: the compact blob minus its
-    /// batched-inverse tail (the program recomputes that by binary xgcd).
+    /// batched-inverse tail (the program recomputes that by divsteps).
     pub fn generate_compact_xgcd(msg: &[u8]) -> Vec<u8> {
         generate_compact_prefix(msg, 0).0
     }
+
+    /// The 96-byte parity blob: the two root halves alone, each shipped
+    /// as the +-root whose parity (Montgomery form, so the low limb) is
+    /// its branch bit. Steering ships the other root: its parity selects
+    /// the wrong branch, whose gx is a non-square, so the program aborts.
+    #[doc(hidden)]
+    pub fn generate_compact_parity_steered(msg: &[u8], steer_flags: u8) -> Vec<u8> {
+        let u = hash_to_field_g2(crate::dst::G2_RO, msg);
+        let mut blob = Vec::with_capacity(C_PARITY_TOTAL);
+        for i in 0..2 {
+            let pre = sswu_pre(&u[i]).unwrap();
+            let (flag, mut y) = compact_map_root(&pre);
+            let want = flag ^ ((steer_flags >> i) & 1);
+            if (y.c0[0] & 1) as u8 != want {
+                y = neg2(&y);
+            }
+            blob.extend_from_slice(&limbs_to_be(&y.c0));
+        }
+        blob
+    }
+
+    /// The honest 96-byte parity blob.
+    pub fn generate_compact_parity(msg: &[u8]) -> Vec<u8> {
+        generate_compact_parity_steered(msg, 0)
+    }
+
 
     /// The other square root for the first map: an equally valid witness
     /// that must not steer. Negating c0 negates one batch factor, so the

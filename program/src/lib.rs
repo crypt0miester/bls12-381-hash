@@ -5,7 +5,7 @@ use core::hint::black_box;
 use bls381_hash::dst::{G1_NU, G1_RO, G2_NU, G2_RO};
 use bls381_hash::{
     encode_to_g1, encode_to_g2, hash_to_g1, hash_to_g1_modexp, hash_to_g2,
-    hash_to_g2_compact, hash_to_g2_compact_xgcd,
+    hash_to_g2_compact, hash_to_g2_compact_parity, hash_to_g2_compact_xgcd,
 };
 
 use bls12_381::{
@@ -387,17 +387,24 @@ fn process_instruction(
             set_return_data(&out);
         }
         // Witness-free-inverse hash_to_G2: the 97-byte blob, batched
-        // inverse recomputed in-program by binary xgcd.
+        // inverse recomputed in-program by extended gcd (divsteps).
         49 => {
             let out = hash_to_g2_compact_xgcd(G2_RO, payload)?;
             set_return_data(&out);
         }
-        // End-to-end min-pk vote verify against the compact (54) and
-        // witness-free-inverse (55) blobs. Tag 51 stays untouched and
-        // fully inlined so its measurement is byte-stable; these two share
-        // a helper and are comparable to each other.
+        // Parity hash_to_G2: the 96-byte blob, branch bits riding the
+        // root halves' parity instead of a flags byte.
+        50 => {
+            let out = hash_to_g2_compact_parity(G2_RO, payload)?;
+            set_return_data(&out);
+        }
+        // End-to-end min-pk vote verify against the compact (54),
+        // witness-free-inverse (55) and parity (56) blobs. Tag 51 stays
+        // untouched and fully inlined so its measurement is byte-stable;
+        // these share a helper and are comparable to each other.
         54 => min_pk_verify_with(payload, hash_to_g2_compact)?,
         55 => min_pk_verify_with(payload, hash_to_g2_compact_xgcd)?,
+        56 => min_pk_verify_with(payload, hash_to_g2_compact_parity)?,
         // Witnessed pipeline stage prefixes: payload is stage byte, blob, msg.
         46 => {
             let (&stage, rest) = payload

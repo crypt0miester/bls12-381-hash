@@ -38,7 +38,48 @@ macro_rules! stage {
     }};
 }
 
+/// Straight-line divsteps row pass: dst = (x a + y b) / 2^30 with the
+/// shifted store. One matrix row per pass keeps the live set inside the
+/// ten sBPF registers; expansion only, like dot!, because rolled loops
+/// pay index arithmetic and loop control per limb.
+macro_rules! row_limbs {
+    ($dst:ident $a:ident $b:ident $c:ident, $x:ident $y:ident; $($i:literal)*) => {
+        $(
+            $c += $x * $a[$i] + $y * $b[$i];
+            $dst[$i - 1] = $c & M30S;
+            $c >>= 30;
+        )*
+    };
+}
+
+/// The g row pass: row_limbs plus the or-fold for the zero test
+macro_rules! row_limbs_fold {
+    ($dst:ident $a:ident $b:ident $c:ident $nonzero:ident, $x:ident $y:ident; $($i:literal)*) => {
+        $(
+            $c += $x * $a[$i] + $y * $b[$i];
+            $dst[$i - 1] = $c & M30S;
+            $nonzero |= $c & M30S;
+            $c >>= 30;
+        )*
+    };
+}
+
+/// The d/e row pass: row_limbs plus the modulus quotient term realizing
+/// the mod-p division by 2^30
+macro_rules! row_limbs_modp {
+    ($dst:ident $a:ident $b:ident $c:ident, $x:ident $y:ident $m:ident; $($i:literal)*) => {
+        $(
+            $c += $x * $a[$i] + $y * $b[$i] + P30S[$i] * $m;
+            $dst[$i - 1] = $c & M30S;
+            $c >>= 30;
+        )*
+    };
+}
+
 pub(crate) use dot;
 pub(crate) use lane;
 pub(crate) use quotient;
+pub(crate) use row_limbs;
+pub(crate) use row_limbs_fold;
+pub(crate) use row_limbs_modp;
 pub(crate) use stage;

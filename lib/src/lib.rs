@@ -49,6 +49,8 @@ pub use crate::g2::hash_to_g2;
 pub use crate::g2::hash_to_g2_compact;
 #[cfg(feature = "g2-ro")]
 pub use crate::g2::hash_to_g2_compact_xgcd;
+#[cfg(feature = "g2-ro")]
+pub use crate::g2::hash_to_g2_compact_parity;
 #[doc(hidden)]
 #[cfg(feature = "g1-ro")]
 pub use crate::g1::hash_to_g1_prefix;

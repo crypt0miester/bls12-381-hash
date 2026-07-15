@@ -115,6 +115,18 @@ pub const R: [u64; 6] = ms([
     0x15f65ec3fa80e493,
 ]);
 
+/// R^3 mod p: one mont_mul by this maps x^-1 of a Montgomery-form value
+/// back into Montgomery form (literal is (2^384)^3 mod p, msn 18 lifts
+/// the three radix factors to 2^390)
+pub const R3: [u64; 6] = msn([
+    0xed48ac6bd94ca1e0,
+    0x315f831e03a7adf8,
+    0x9a53352a615e29dd,
+    0x34c04e5e921e1761,
+    0x2512d43565724728,
+    0x0aa6346091755d4d,
+], 18);
+
 pub const SSWU_ELLP_A: [u64; 6] = ms([
     0x2f65aa0e9af5aa51,
     0x86464c2d1e8416c3,

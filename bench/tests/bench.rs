@@ -290,6 +290,7 @@ fn bench_function_costs() {
         (22, "be/le round trip", 50_000),
         (23, "expand_message_xmd g1", 100),
         (24, "expand_message_xmd g2", 100),
+        (25, "inv_divsteps", 200),
     ];
     println!("per function CU:");
     for &(id, name, n) in probes {
@@ -586,6 +587,117 @@ fn bench_witness_hash_to_g2_compact_xgcd() {
     assert!(rejected.program_result.is_err(), "corrupt xgcd witness was accepted");
 }
 
+#[test]
+fn bench_witness_hash_to_g2_compact_parity() {
+    let mollusk = mollusk();
+
+    let witnesses = bls381_hash::witness::g2::generate_compact_parity(MESSAGE);
+    assert_eq!(witnesses.len(), 96);
+    let mut payload = witnesses.clone();
+    payload.extend_from_slice(MESSAGE);
+
+    let result = run(&mollusk, 50, &payload);
+    assert!(
+        !result.program_result.is_err(),
+        "parity hash_to_g2 failed: {:?}",
+        result.program_result
+    );
+    assert_eq!(result.return_data, blst_hash_g2_serialized(MESSAGE).to_vec(), "differs from blst");
+
+    println!(
+        "parity witness-assisted hash_to_G2: {} CU ({} witness bytes)",
+        result.compute_units_consumed,
+        witnesses.len()
+    );
+
+    let mut bad = payload.clone();
+    bad[60] ^= 1;
+    let rejected = run(&mollusk, 50, &bad);
+    assert!(rejected.program_result.is_err(), "corrupt parity witness was accepted");
+}
+
+// CU spread across messages: the divsteps batch count varies with the
+// input (typical convergence ~27-28 of the 37-batch cap), so the parity
+// hash cost moves a little per message. Also pins blst byte-equality
+// across inputs, not just the fixture message.
+#[test]
+fn bench_parity_message_spread() {
+    let mollusk = mollusk();
+    let (mut lo, mut hi, mut sum) = (u64::MAX, 0u64, 0u64);
+    let messages: Vec<Vec<u8>> = (0..8u8)
+        .map(|i| format!("tapedrive vote payload: epoch {i}, slot {}", 1337 + i as u32).into_bytes())
+        .collect();
+    for msg in &messages {
+        let mut payload = bls381_hash::witness::g2::generate_compact_parity(msg);
+        payload.extend_from_slice(msg);
+        let r = run(&mollusk, 50, &payload);
+        assert!(!r.program_result.is_err(), "parity hash failed");
+        assert_eq!(r.return_data, blst_hash_g2_serialized(msg).to_vec(), "differs from blst");
+        let cu = r.compute_units_consumed;
+        lo = lo.min(cu);
+        hi = hi.max(cu);
+        sum += cu;
+    }
+    println!(
+        "parity hash CU over {} messages: min {lo} / avg {} / max {hi}",
+        messages.len(),
+        sum / messages.len() as u64
+    );
+}
+
+// The parity layout's soundness sweep. No flags byte exists, so the flag
+// probes drop out, and the other square root is no longer an equally valid
+// witness: negating a root half flips its parity, which reads as a branch
+// lie and must abort (the steered generator ships exactly those roots).
+#[test]
+fn witness_g2_parity_soundness() {
+    let mollusk = mollusk();
+
+    let witness = bls381_hash::witness::g2::generate_compact_parity(MESSAGE);
+    let mut payload = witness.clone();
+    payload.extend_from_slice(MESSAGE);
+
+    let good = run(&mollusk, 50, &payload);
+    assert!(!good.program_result.is_err(), "honest witness rejected");
+    let truth = good.return_data.clone();
+
+    for i in 0..witness.len() {
+        let mut bad = payload.clone();
+        bad[i] ^= 1;
+        let r = run(&mollusk, 50, &bad);
+        if !r.program_result.is_err() {
+            assert_eq!(r.return_data, truth, "witness byte {i} steered the output");
+        }
+    }
+
+    // a witness limb at or above the modulus must be rejected by the parser
+    for start in [0usize, 48] {
+        let mut oob = payload.clone();
+        for byte in oob[start..start + 48].iter_mut() {
+            *byte = 0xff;
+        }
+        assert!(
+            run(&mollusk, 50, &oob).program_result.is_err(),
+            "out-of-range witness accepted at byte {start}"
+        );
+    }
+
+    // the witness is bound to the message it was generated for
+    let mut replay = witness.clone();
+    replay.extend_from_slice(b"a different snapshot vote payload");
+    assert!(run(&mollusk, 50, &replay).program_result.is_err(), "cross-message replay accepted");
+
+    // the other root of either map is a parity lie, not a valid witness
+    for steer in [1u8, 2, 3] {
+        let mut lied = bls381_hash::witness::g2::generate_compact_parity_steered(MESSAGE, steer);
+        lied.extend_from_slice(MESSAGE);
+        assert!(
+            run(&mollusk, 50, &lied).program_result.is_err(),
+            "flipped root (parity lie {steer:#04b}) accepted"
+        );
+    }
+}
+
 // The compact-blob counterpart of witness_g2_soundness, shared by both
 // layouts: no bit of the blob can steer the output, the flag range is
 // canonical, witnesses are message-bound, the other square root does not
@@ -816,6 +928,7 @@ fn bench_witness_nu_encode() {
 fn field_arithmetic_selftest() {
     bls381_hash::witness::g1::iso11_adapted_selftest();
     bls381_hash::witness::g1::redc_selftest();
+    bls381_hash::witness::g1::inv_divsteps_selftest();
 }
 
 #[test]
@@ -877,7 +990,8 @@ fn bench_min_pk_verify_end_to_end() {
 }
 
 // The same end-to-end min-pk verify against the 145-byte compact witness
-// (tag 54) and the 97-byte witness-free-inverse blob (tag 55).
+// (tag 54), the 97-byte witness-free-inverse blob (tag 55) and the
+// 96-byte parity blob (tag 56).
 #[test]
 fn bench_min_pk_verify_compact_end_to_end() {
     use blst::min_pk::{AggregatePublicKey, AggregateSignature, PublicKey, SecretKey, Signature};
@@ -898,6 +1012,7 @@ fn bench_min_pk_verify_compact_end_to_end() {
 
     let witness = bls381_hash::witness::g2::generate_compact(MESSAGE);
     let witness_xgcd = bls381_hash::witness::g2::generate_compact_xgcd(MESSAGE);
+    let witness_parity = bls381_hash::witness::g2::generate_compact_parity(MESSAGE);
 
     for k in [14usize, 20] {
         let sigs: Vec<Signature> = keys[..k]
@@ -919,6 +1034,7 @@ fn bench_min_pk_verify_compact_end_to_end() {
         for (tag, label, wit) in [
             (54u8, "compact", &witness),
             (55, "xgcd", &witness_xgcd),
+            (56, "parity", &witness_parity),
         ] {
             let mut payload = head.clone();
             payload.extend_from_slice(wit);

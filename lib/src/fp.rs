@@ -5,7 +5,7 @@
 use solana_program_error::ProgramError;
 
 use crate::consts_g1::{INV, MODULUS, R2};
-use crate::macros::{dot, lane, quotient};
+use crate::macros::{dot, lane, quotient, row_limbs, row_limbs_fold, row_limbs_modp};
 
 pub(crate) type Fp = [u64; 6];
 
@@ -252,45 +252,230 @@ pub(crate) fn half_mod(a: &Fp) -> Fp {
     }
 }
 
-/// Inverse of a canonical nonzero residue by binary extended gcd:
-/// shift-and-subtract only, no multiplies, so it prices as plain ALU work
-/// on sBPF v3 where a witnessed or modexp inverse is unavailable or costs
-/// bytes. Invariants x1*a == u, x2*a == v (mod p); every outer pass strips
-/// at least one bit from u or v, so 768 passes cover 2x384 bits and the
-/// cap is unreachable for valid inputs (p prime, 0 < a < p).
-pub(crate) fn inv_xgcd(a: &Fp) -> Result<Fp, ProgramError> {
+// Modular inverse by Bernstein-Yang divsteps ("safegcd"): up to 37 batches
+// of 30 divsteps on the low lanes, each batch applied to the full values
+// as signed 13-lane row passes. The 2024 hull analysis bounds 381-bit
+// inputs by 1078 divsteps (36 batches; the cap keeps the older 1101
+// bound's margin) and the loop exits as soon as g == 0.
+// tools/check_divsteps.py mirrors this code lane for lane and carries
+// the bound and overflow arguments.
+
+const M30S: i64 = MASK30 as i64;
+
+/// p^-1 mod 2^30 (positive, cut from the negated 64-bit INV)
+const PINV30: i64 = (INV.wrapping_neg() & MASK30) as i64;
+const _: () = assert!((P30[0] as i64).wrapping_mul(PINV30) & M30S == 1);
+
+/// The modulus in signed lanes for the d/e updates
+const P30S: [i64; 13] = {
+    let mut r = [0i64; 13];
+    let mut i = 0;
+    while i < 13 {
+        r[i] = P30[i] as i64;
+        i += 1;
+    }
+    r
+};
+
+/// Signed-lane values: lanes 0..11 proper in [0, 2^30), lane 12 carries
+/// the sign; everything stays within (-2p, 2p), so lane 12 fits 23 bits.
+type S13 = [i64; 13];
+
+#[inline(always)]
+fn split30_signed(x: &Fp) -> S13 {
+    let u = split30(x);
+    let mut r = [0i64; 13];
+    let mut i = 0;
+    while i < 13 {
+        r[i] = u[i] as i64;
+        i += 1;
+    }
+    r
+}
+
+/// 30 divsteps on the low lanes, batched, with eta = -delta. Branchy on
+/// purpose: nothing on chain is secret, and a taken branch beats a masked
+/// select on sBPF. Each w-round cancels min(eta+1, remaining, 6) low bits
+/// of g with one multiple of f, using the odd-f identity
+/// f*(f^2-2) == -f^-1 mod 2^6, and shifts them out in one go: the first
+/// consumed step is the odd add, the rest are the even halvings, and an
+/// odd add at consumed step j needs delta + j - 1 <= 0, hence the eta+1
+/// cap. The f row doubles per consumed step instead of g halving, so the
+/// matrix stays integral, t/2^30 is the true transition, and |u|+|v| and
+/// |q|+|r| stay within 2^30. In-loop |f|, |g| stay under 2^32 and the
+/// w-round transients under 2^37.
+#[inline(always)]
+fn divsteps30(mut eta: i64, f0: i64, g0: i64) -> (i64, i64, i64, i64, i64) {
+    let (mut u, mut v, mut q, mut r) = (1i64, 0i64, 0i64, 1i64);
+    let (mut f, mut g) = (f0, g0);
+    let mut i = 30i64;
+    loop {
+        debug_assert!(f & 1 == 1);
+        // strip trailing zeros of g one at a time, up to the step budget
+        while g & 1 == 0 {
+            g >>= 1;
+            u <<= 1;
+            v <<= 1;
+            eta -= 1;
+            i -= 1;
+            if i == 0 {
+                return (eta, u, v, q, r);
+            }
+        }
+        if eta < 0 {
+            eta = -eta;
+            core::mem::swap(&mut f, &mut g);
+            g = -g;
+            core::mem::swap(&mut u, &mut q);
+            q = -q;
+            core::mem::swap(&mut v, &mut r);
+            r = -r;
+        }
+        let limit = (eta + 1).min(i).min(6);
+        let m = (1i64 << limit) - 1;
+        let w = g.wrapping_mul(f.wrapping_mul(f.wrapping_mul(f).wrapping_sub(2))) & m;
+        debug_assert!(w & 1 == 1);
+        g += w * f;
+        debug_assert!(g & m == 0);
+        q += w * u;
+        r += w * v;
+        g >>= limit;
+        u <<= limit;
+        v <<= limit;
+        eta -= limit;
+        i -= limit;
+        if i == 0 {
+            return (eta, u, v, q, r);
+        }
+    }
+}
+
+/// One batch applied to f and g: t*(f, g) / 2^30, the division exact by
+/// the matrix construction. Two row passes so each keeps one matrix row
+/// and one accumulator live: the f row lands in fout (the caller swaps
+/// buffers), the g row updates in place, reading the untouched old f.
+/// Returns whether g became zero (the or-fold is free next to the
+/// stores), which ends the outer loop early: once g == 0 every further
+/// batch is the identity on f, d and e (matrix [[2^30, 0], [0, 1]],
+/// cancelled by the shared division).
+#[inline(never)]
+fn update_fg(f: &S13, g: &mut S13, fout: &mut S13, u: i64, v: i64, q: i64, r: i64) -> bool {
+    let mut cf = u * f[0] + v * g[0];
+    debug_assert!(cf & M30S == 0);
+    cf >>= 30;
+    row_limbs!(fout f g cf, u v; 1 2 3 4 5 6 7 8 9 10 11 12);
+    fout[12] = cf;
+    let mut cg = q * f[0] + r * g[0];
+    debug_assert!(cg & M30S == 0);
+    cg >>= 30;
+    let mut nonzero = 0i64;
+    row_limbs_fold!(g f g cg nonzero, q r; 1 2 3 4 5 6 7 8 9 10 11 12);
+    g[12] = cg;
+    (nonzero | cg) == 0
+}
+
+/// One batch applied to d and e mod p: t*(d, e) / 2^30 with the division
+/// realized by adding the p-multiple that zeroes the low 30 bits (md/me,
+/// one wrapping multiply by PINV30 each); the sign masks fold an extra p
+/// in for negative d/e, keeping both in (-2p, p). Two row passes like
+/// update_fg; the head quotients need the old d[0] and e[0], so both are
+/// fixed before either pass stores.
+#[inline(never)]
+fn update_de(d: &S13, e: &mut S13, dout: &mut S13, u: i64, v: i64, q: i64, r: i64) {
+    let sd = d[12] >> 63;
+    let se = e[12] >> 63;
+    let mut md = (u & sd) + (v & se);
+    let mut me = (q & sd) + (r & se);
+    let mut cd = u * d[0] + v * e[0];
+    let mut ce = q * d[0] + r * e[0];
+    md -= PINV30.wrapping_mul(cd).wrapping_add(md) & M30S;
+    me -= PINV30.wrapping_mul(ce).wrapping_add(me) & M30S;
+    cd += P30S[0] * md;
+    ce += P30S[0] * me;
+    debug_assert!(cd & M30S == 0 && ce & M30S == 0);
+    cd >>= 30;
+    ce >>= 30;
+    row_limbs_modp!(dout d e cd, u v md; 1 2 3 4 5 6 7 8 9 10 11 12);
+    dout[12] = cd;
+    row_limbs_modp!(e d e ce, q r me; 1 2 3 4 5 6 7 8 9 10 11 12);
+    e[12] = ce;
+}
+
+/// Conditionally negate d (in (-2p, p)), lift by p while negative (two
+/// masked passes cover the worst case), and pack canonical
+fn signed_to_fp(d: &S13, negate: i64) -> Fp {
+    let mut t = [0i64; 13];
+    let mut carry = 0i64;
+    for i in 0..12 {
+        let lane = ((d[i] ^ negate) - negate) + carry;
+        t[i] = lane & M30S;
+        carry = lane >> 30;
+    }
+    t[12] = ((d[12] ^ negate) - negate) + carry;
+    for _ in 0..2 {
+        let lift = t[12] >> 63;
+        let mut carry = 0i64;
+        for i in 0..12 {
+            let lane = t[i] + (P30S[i] & lift) + carry;
+            t[i] = lane & M30S;
+            carry = lane >> 30;
+        }
+        t[12] += (P30S[12] & lift) + carry;
+    }
+    debug_assert!(t[12] >= 0);
+    let mut out = [0u64; 13];
+    let mut i = 0;
+    while i < 13 {
+        out[i] = t[i] as u64;
+        i += 1;
+    }
+    pack30(&out)
+}
+
+/// Inverse of a nonzero residue below p, of the value as given (feed it a
+/// Montgomery-form element and multiply by R3 to return to that domain).
+/// The cost moves mildly with the input through the batch count, bounded
+/// by the cap.
+pub(crate) fn inv_divsteps(a: &Fp) -> Result<Fp, ProgramError> {
     if is_zero(a) {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let mut u = *a;
-    let mut v = MODULUS;
-    let mut x1 = ONE;
-    let mut x2 = [0u64; 6];
-    for _ in 0..768 {
-        if is_one(&u) {
-            return Ok(x1);
-        }
-        if is_one(&v) {
-            return Ok(x2);
-        }
-        while u[0] & 1 == 0 {
-            u = shr1(&u);
-            x1 = half_mod(&x1);
-        }
-        while v[0] & 1 == 0 {
-            v = shr1(&v);
-            x2 = half_mod(&x2);
-        }
-        if geq(&u, &v) {
-            u = sub_nocheck(&u, &v);
-            x1 = sub_mod(&x1, &x2);
-        } else {
-            v = sub_nocheck(&v, &u);
-            x2 = sub_mod(&x2, &x1);
+    let mut d_a = [0i64; 13];
+    let mut d_b = [0i64; 13];
+    let mut e = [0i64; 13];
+    e[0] = 1;
+    let mut f_a = P30S;
+    let mut f_b = [0i64; 13];
+    let mut g = split30_signed(a);
+    // the row passes write f and d into the spare buffer; swapping the
+    // references costs a register move, not a copy
+    let (mut f, mut f_next) = (&mut f_a, &mut f_b);
+    let (mut d, mut d_next) = (&mut d_a, &mut d_b);
+    let mut eta = -1i64;
+    let mut done = false;
+    for _ in 0..37 {
+        let (eta_next, u, v, q, r) = divsteps30(eta, f[0], g[0]);
+        eta = eta_next;
+        done = update_fg(f, &mut g, f_next, u, v, q, r);
+        update_de(d, &mut e, d_next, u, v, q, r);
+        core::mem::swap(&mut f, &mut f_next);
+        core::mem::swap(&mut d, &mut d_next);
+        if done {
+            break;
         }
     }
-    Err(ProgramError::InvalidInstructionData)
+    // gcd(a, p) = 1 for 0 < a < p prime, so these are unreachable defense
+    // in depth like the old xgcd pass cap
+    let one: S13 = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let minus_one: S13 = [
+        M30S, M30S, M30S, M30S, M30S, M30S, M30S, M30S, M30S, M30S, M30S, M30S, -1,
+    ];
+    if !done || (*f != one && *f != minus_one) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok(signed_to_fp(d, f[12] >> 63))
 }
+
 
 pub(crate) fn wit48(bytes: &[u8]) -> Result<Fp, ProgramError> {
     let arr: &[u8; 48] = bytes

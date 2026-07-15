@@ -577,6 +577,42 @@ pub mod witness {
         }
     }
 
+    /// Correctness guard for the in-program batch inversion: divsteps
+    /// against a product-is-one check and the Fermat inverse, over edges
+    /// and a chain of varied residues; zero must error.
+    pub fn inv_divsteps_selftest() {
+        use crate::consts_g1::{MODULUS, R3};
+        let one: Fp = [1, 0, 0, 0, 0, 0];
+        let mut cases: Vec<Fp> = alloc::vec![
+            one,
+            [2, 0, 0, 0, 0, 0],
+            neg_mod(&one),
+            sub_nocheck(&MODULUS, &[2, 0, 0, 0, 0, 0]),
+            half_mod(&one),
+            R,
+            R2,
+            R3,
+        ];
+        let mut a = R2;
+        for _ in 0..300 {
+            a = mont_mul(&a, &R2);
+            cases.push(a);
+        }
+        for case in &cases {
+            let inv = inv_divsteps(case).unwrap();
+            assert!(geq(&sub_nocheck(&MODULUS, &one), &inv), "inverse not canonical");
+            // case * inv == 1 as plain residues: two mont_muls cancel the R factors
+            assert_eq!(mont_mul(&mont_mul(case, &inv), &R2), one, "product is not one");
+            // and the R3 lift matches the Fermat inverse in the Montgomery domain
+            assert_eq!(
+                mont_mul(&inv, &R3),
+                pow_mont(case, &exp_inverse()),
+                "R3 lift disagrees with Fermat"
+            );
+        }
+        assert!(inv_divsteps(&[0u64; 6]).is_err(), "zero must not invert");
+    }
+
     fn pow_mont(base: &Fp, exp_be: &[u8; 48]) -> Fp {
         let mut table = [R; 16];
         table[1] = *base;
