@@ -6,7 +6,7 @@
 /// length or the expansion fails to compile.
 macro_rules! dot {
     ($sum:ident, $x:ident $($i:literal)*, $y:ident $($j:literal)*) => {
-        $( $sum += $x[$i] * $y[$j]; )*
+        $( $sum = $sum.wrapping_add($x[$i].wrapping_mul($y[$j])); )*
     };
 }
 
@@ -14,7 +14,7 @@ macro_rules! dot {
 macro_rules! quotient {
     ($sum:ident, $m:ident $k:literal) => {
         $m[$k] = $sum.wrapping_mul(INV30) & MASK30;
-        $sum = ($sum + $m[$k] * P30[0]) >> 30;
+        $sum = $sum.wrapping_add($m[$k].wrapping_mul(P30[0])) >> 30;
     };
 }
 
@@ -45,7 +45,7 @@ macro_rules! stage {
 macro_rules! row_limbs {
     ($dst:ident $a:ident $b:ident $c:ident, $x:ident $y:ident; $($i:literal)*) => {
         $(
-            $c += $x * $a[$i] + $y * $b[$i];
+            $c = $c.wrapping_add($x.wrapping_mul($a[$i])).wrapping_add($y.wrapping_mul($b[$i]));
             $dst[$i - 1] = $c & M30S;
             $c >>= 30;
         )*
@@ -56,7 +56,7 @@ macro_rules! row_limbs {
 macro_rules! row_limbs_fold {
     ($dst:ident $a:ident $b:ident $c:ident $nonzero:ident, $x:ident $y:ident; $($i:literal)*) => {
         $(
-            $c += $x * $a[$i] + $y * $b[$i];
+            $c = $c.wrapping_add($x.wrapping_mul($a[$i])).wrapping_add($y.wrapping_mul($b[$i]));
             $dst[$i - 1] = $c & M30S;
             $nonzero |= $c & M30S;
             $c >>= 30;
@@ -69,7 +69,7 @@ macro_rules! row_limbs_fold {
 macro_rules! row_limbs_modp {
     ($dst:ident $a:ident $b:ident $c:ident, $x:ident $y:ident $m:ident; $($i:literal)*) => {
         $(
-            $c += $x * $a[$i] + $y * $b[$i] + P30S[$i] * $m;
+            $c = $c.wrapping_add($x.wrapping_mul($a[$i])).wrapping_add($y.wrapping_mul($b[$i])).wrapping_add(P30S[$i].wrapping_mul($m));
             $dst[$i - 1] = $c & M30S;
             $c >>= 30;
         )*

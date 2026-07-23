@@ -23,14 +23,14 @@ const ONE: Fp = [1, 0, 0, 0, 0, 0];
 fn adc(a: u64, b: u64, carry: u64) -> (u64, u64) {
     let (s, c1) = a.overflowing_add(b);
     let (s, c2) = s.overflowing_add(carry);
-    (s, c1 as u64 + c2 as u64)
+    (s, (c1 as u64).wrapping_add(c2 as u64))
 }
 
 #[inline(always)]
 fn sbb(a: u64, b: u64, borrow: u64) -> (u64, u64) {
     let (d, b1) = a.overflowing_sub(b);
     let (d, b2) = d.overflowing_sub(borrow);
-    (d, b1 as u64 + b2 as u64)
+    (d, (b1 as u64).wrapping_add(b2 as u64))
 }
 
 #[inline(always)]
@@ -316,33 +316,33 @@ fn divsteps30(mut eta: i64, f0: i64, g0: i64) -> (i64, i64, i64, i64, i64) {
             g >>= 1;
             u <<= 1;
             v <<= 1;
-            eta -= 1;
+            eta = eta.wrapping_sub(1);
             i -= 1;
             if i == 0 {
                 return (eta, u, v, q, r);
             }
         }
         if eta < 0 {
-            eta = -eta;
+            eta = eta.wrapping_neg();
             core::mem::swap(&mut f, &mut g);
-            g = -g;
+            g = g.wrapping_neg();
             core::mem::swap(&mut u, &mut q);
-            q = -q;
+            q = q.wrapping_neg();
             core::mem::swap(&mut v, &mut r);
-            r = -r;
+            r = r.wrapping_neg();
         }
-        let limit = (eta + 1).min(i).min(6);
+        let limit = eta.wrapping_add(1).min(i).min(6);
         let m = (1i64 << limit) - 1;
         let w = g.wrapping_mul(f.wrapping_mul(f.wrapping_mul(f).wrapping_sub(2))) & m;
         debug_assert!(w & 1 == 1);
-        g += w * f;
+        g = g.wrapping_add(w.wrapping_mul(f));
         debug_assert!(g & m == 0);
-        q += w * u;
-        r += w * v;
+        q = q.wrapping_add(w.wrapping_mul(u));
+        r = r.wrapping_add(w.wrapping_mul(v));
         g >>= limit;
         u <<= limit;
         v <<= limit;
-        eta -= limit;
+        eta = eta.wrapping_sub(limit);
         i -= limit;
         if i == 0 {
             return (eta, u, v, q, r);
@@ -360,12 +360,12 @@ fn divsteps30(mut eta: i64, f0: i64, g0: i64) -> (i64, i64, i64, i64, i64) {
 /// cancelled by the shared division).
 #[inline(never)]
 fn update_fg(f: &S13, g: &mut S13, fout: &mut S13, u: i64, v: i64, q: i64, r: i64) -> bool {
-    let mut cf = u * f[0] + v * g[0];
+    let mut cf = u.wrapping_mul(f[0]).wrapping_add(v.wrapping_mul(g[0]));
     debug_assert!(cf & M30S == 0);
     cf >>= 30;
     row_limbs!(fout f g cf, u v; 1 2 3 4 5 6 7 8 9 10 11 12);
     fout[12] = cf;
-    let mut cg = q * f[0] + r * g[0];
+    let mut cg = q.wrapping_mul(f[0]).wrapping_add(r.wrapping_mul(g[0]));
     debug_assert!(cg & M30S == 0);
     cg >>= 30;
     let mut nonzero = 0i64;
@@ -384,14 +384,14 @@ fn update_fg(f: &S13, g: &mut S13, fout: &mut S13, u: i64, v: i64, q: i64, r: i6
 fn update_de(d: &S13, e: &mut S13, dout: &mut S13, u: i64, v: i64, q: i64, r: i64) {
     let sd = d[12] >> 63;
     let se = e[12] >> 63;
-    let mut md = (u & sd) + (v & se);
-    let mut me = (q & sd) + (r & se);
-    let mut cd = u * d[0] + v * e[0];
-    let mut ce = q * d[0] + r * e[0];
-    md -= PINV30.wrapping_mul(cd).wrapping_add(md) & M30S;
-    me -= PINV30.wrapping_mul(ce).wrapping_add(me) & M30S;
-    cd += P30S[0] * md;
-    ce += P30S[0] * me;
+    let mut md = (u & sd).wrapping_add(v & se);
+    let mut me = (q & sd).wrapping_add(r & se);
+    let mut cd = u.wrapping_mul(d[0]).wrapping_add(v.wrapping_mul(e[0]));
+    let mut ce = q.wrapping_mul(d[0]).wrapping_add(r.wrapping_mul(e[0]));
+    md = md.wrapping_sub(PINV30.wrapping_mul(cd).wrapping_add(md) & M30S);
+    me = me.wrapping_sub(PINV30.wrapping_mul(ce).wrapping_add(me) & M30S);
+    cd = cd.wrapping_add(P30S[0].wrapping_mul(md));
+    ce = ce.wrapping_add(P30S[0].wrapping_mul(me));
     debug_assert!(cd & M30S == 0 && ce & M30S == 0);
     cd >>= 30;
     ce >>= 30;
@@ -407,20 +407,20 @@ fn signed_to_fp(d: &S13, negate: i64) -> Fp {
     let mut t = [0i64; 13];
     let mut carry = 0i64;
     for i in 0..12 {
-        let lane = ((d[i] ^ negate) - negate) + carry;
+        let lane = ((d[i] ^ negate).wrapping_sub(negate)).wrapping_add(carry);
         t[i] = lane & M30S;
         carry = lane >> 30;
     }
-    t[12] = ((d[12] ^ negate) - negate) + carry;
+    t[12] = ((d[12] ^ negate).wrapping_sub(negate)).wrapping_add(carry);
     for _ in 0..2 {
         let lift = t[12] >> 63;
         let mut carry = 0i64;
         for i in 0..12 {
-            let lane = t[i] + (P30S[i] & lift) + carry;
+            let lane = t[i].wrapping_add(P30S[i] & lift).wrapping_add(carry);
             t[i] = lane & M30S;
             carry = lane >> 30;
         }
-        t[12] += (P30S[12] & lift) + carry;
+        t[12] = t[12].wrapping_add((P30S[12] & lift).wrapping_add(carry));
     }
     debug_assert!(t[12] >= 0);
     let mut out = [0u64; 13];
@@ -604,21 +604,21 @@ pub(crate) fn mont_mul(a: &Fp, b: &Fp) -> Fp {
     sum &= MASK30;
     dot!(sum, m 0 1 2 3 4 5 6 7 8 9, P30 10 9 8 7 6 5 4 3 2 1);
     quotient!(sum, m 10);
-    sum += spill;
+    sum = sum.wrapping_add(spill);
     // column 11
     dot!(sum, a 0 1 2 3 4 5 6 7 8 9 10 11, b 11 10 9 8 7 6 5 4 3 2 1 0);
     let spill = sum >> 30;
     sum &= MASK30;
     dot!(sum, m 0 1 2 3 4 5 6 7 8 9 10, P30 11 10 9 8 7 6 5 4 3 2 1);
     quotient!(sum, m 11);
-    sum += spill;
+    sum = sum.wrapping_add(spill);
     // column 12
     dot!(sum, a 0 1 2 3 4 5 6 7 8 9 10 11 12, b 12 11 10 9 8 7 6 5 4 3 2 1 0);
     let spill = sum >> 30;
     sum &= MASK30;
     dot!(sum, m 0 1 2 3 4 5 6 7 8 9 10 11, P30 12 11 10 9 8 7 6 5 4 3 2 1);
     quotient!(sum, m 12);
-    sum += spill;
+    sum = sum.wrapping_add(spill);
     // column 13
     dot!(sum, a 1 2 3 4 5 6 7 8 9 10 11 12, b 12 11 10 9 8 7 6 5 4 3 2 1);
     dot!(sum, m 1 2 3 4 5 6 7 8 9 10 11 12, P30 12 11 10 9 8 7 6 5 4 3 2 1);
@@ -680,7 +680,7 @@ pub(crate) fn mont_sqr(a: &Fp) -> Fp {
 
     let mut sum = 0u64;
     // column 0
-    sum += a[0] * a[0];
+    sum = sum.wrapping_add(a[0].wrapping_mul(a[0]));
     quotient!(sum, m 0);
     // column 1
     dot!(sum, twice 0, a 1);
@@ -688,7 +688,7 @@ pub(crate) fn mont_sqr(a: &Fp) -> Fp {
     quotient!(sum, m 1);
     // column 2
     dot!(sum, twice 0, a 2);
-    sum += a[1] * a[1];
+    sum = sum.wrapping_add(a[1].wrapping_mul(a[1]));
     dot!(sum, m 0 1, P30 2 1);
     quotient!(sum, m 2);
     // column 3
@@ -697,7 +697,7 @@ pub(crate) fn mont_sqr(a: &Fp) -> Fp {
     quotient!(sum, m 3);
     // column 4
     dot!(sum, twice 0 1, a 4 3);
-    sum += a[2] * a[2];
+    sum = sum.wrapping_add(a[2].wrapping_mul(a[2]));
     dot!(sum, m 0 1 2 3, P30 4 3 2 1);
     quotient!(sum, m 4);
     // column 5
@@ -706,7 +706,7 @@ pub(crate) fn mont_sqr(a: &Fp) -> Fp {
     quotient!(sum, m 5);
     // column 6
     dot!(sum, twice 0 1 2, a 6 5 4);
-    sum += a[3] * a[3];
+    sum = sum.wrapping_add(a[3].wrapping_mul(a[3]));
     dot!(sum, m 0 1 2 3 4 5, P30 6 5 4 3 2 1);
     quotient!(sum, m 6);
     // column 7
@@ -715,7 +715,7 @@ pub(crate) fn mont_sqr(a: &Fp) -> Fp {
     quotient!(sum, m 7);
     // column 8
     dot!(sum, twice 0 1 2 3, a 8 7 6 5);
-    sum += a[4] * a[4];
+    sum = sum.wrapping_add(a[4].wrapping_mul(a[4]));
     dot!(sum, m 0 1 2 3 4 5 6 7, P30 8 7 6 5 4 3 2 1);
     quotient!(sum, m 8);
     // column 9
@@ -724,34 +724,34 @@ pub(crate) fn mont_sqr(a: &Fp) -> Fp {
     quotient!(sum, m 9);
     // column 10
     dot!(sum, twice 0 1 2 3 4, a 10 9 8 7 6);
-    sum += a[5] * a[5];
+    sum = sum.wrapping_add(a[5].wrapping_mul(a[5]));
     let spill = sum >> 30;
     sum &= MASK30;
     dot!(sum, m 0 1 2 3 4 5 6 7 8 9, P30 10 9 8 7 6 5 4 3 2 1);
     quotient!(sum, m 10);
-    sum += spill;
+    sum = sum.wrapping_add(spill);
     // column 11
     dot!(sum, twice 0 1 2 3 4 5, a 11 10 9 8 7 6);
     let spill = sum >> 30;
     sum &= MASK30;
     dot!(sum, m 0 1 2 3 4 5 6 7 8 9 10, P30 11 10 9 8 7 6 5 4 3 2 1);
     quotient!(sum, m 11);
-    sum += spill;
+    sum = sum.wrapping_add(spill);
     // column 12
     dot!(sum, twice 0 1 2 3 4 5, a 12 11 10 9 8 7);
-    sum += a[6] * a[6];
+    sum = sum.wrapping_add(a[6].wrapping_mul(a[6]));
     let spill = sum >> 30;
     sum &= MASK30;
     dot!(sum, m 0 1 2 3 4 5 6 7 8 9 10 11, P30 12 11 10 9 8 7 6 5 4 3 2 1);
     quotient!(sum, m 12);
-    sum += spill;
+    sum = sum.wrapping_add(spill);
     // column 13
     dot!(sum, twice 1 2 3 4 5 6, a 12 11 10 9 8 7);
     dot!(sum, m 1 2 3 4 5 6 7 8 9 10 11 12, P30 12 11 10 9 8 7 6 5 4 3 2 1);
     lane!(sum, r 0);
     // column 14
     dot!(sum, twice 2 3 4 5 6, a 12 11 10 9 8);
-    sum += a[7] * a[7];
+    sum = sum.wrapping_add(a[7].wrapping_mul(a[7]));
     dot!(sum, m 2 3 4 5 6 7 8 9 10 11 12, P30 12 11 10 9 8 7 6 5 4 3 2);
     lane!(sum, r 1);
     // column 15
@@ -760,7 +760,7 @@ pub(crate) fn mont_sqr(a: &Fp) -> Fp {
     lane!(sum, r 2);
     // column 16
     dot!(sum, twice 4 5 6 7, a 12 11 10 9);
-    sum += a[8] * a[8];
+    sum = sum.wrapping_add(a[8].wrapping_mul(a[8]));
     dot!(sum, m 4 5 6 7 8 9 10 11 12, P30 12 11 10 9 8 7 6 5 4);
     lane!(sum, r 3);
     // column 17
@@ -769,7 +769,7 @@ pub(crate) fn mont_sqr(a: &Fp) -> Fp {
     lane!(sum, r 4);
     // column 18
     dot!(sum, twice 6 7 8, a 12 11 10);
-    sum += a[9] * a[9];
+    sum = sum.wrapping_add(a[9].wrapping_mul(a[9]));
     dot!(sum, m 6 7 8 9 10 11 12, P30 12 11 10 9 8 7 6);
     lane!(sum, r 5);
     // column 19
@@ -778,7 +778,7 @@ pub(crate) fn mont_sqr(a: &Fp) -> Fp {
     lane!(sum, r 6);
     // column 20
     dot!(sum, twice 8 9, a 12 11);
-    sum += a[10] * a[10];
+    sum = sum.wrapping_add(a[10].wrapping_mul(a[10]));
     dot!(sum, m 8 9 10 11 12, P30 12 11 10 9 8);
     lane!(sum, r 7);
     // column 21
@@ -787,7 +787,7 @@ pub(crate) fn mont_sqr(a: &Fp) -> Fp {
     lane!(sum, r 8);
     // column 22
     dot!(sum, twice 10, a 12);
-    sum += a[11] * a[11];
+    sum = sum.wrapping_add(a[11].wrapping_mul(a[11]));
     dot!(sum, m 10 11 12, P30 12 11 10);
     lane!(sum, r 9);
     // column 23
@@ -795,7 +795,7 @@ pub(crate) fn mont_sqr(a: &Fp) -> Fp {
     dot!(sum, m 11 12, P30 12 11);
     lane!(sum, r 10);
     // column 24
-    sum += a[12] * a[12];
+    sum = sum.wrapping_add(a[12].wrapping_mul(a[12]));
     dot!(sum, m 12, P30 12);
     lane!(sum, r 11);
     debug_assert!(sum <= MASK30);
@@ -811,26 +811,26 @@ pub(crate) fn from_mont(x: &Fp) -> Fp {
 
     let mut sum = 0u64;
     // column 0
-    sum += t[0];
+    sum = sum.wrapping_add(t[0]);
     quotient!(sum, m 0);
     // column 1
-    sum += t[1];
+    sum = sum.wrapping_add(t[1]);
     dot!(sum, m 0, P30 1);
     quotient!(sum, m 1);
     // column 2
-    sum += t[2];
+    sum = sum.wrapping_add(t[2]);
     dot!(sum, m 0 1, P30 2 1);
     quotient!(sum, m 2);
     // column 3
-    sum += t[3];
+    sum = sum.wrapping_add(t[3]);
     dot!(sum, m 0 1 2, P30 3 2 1);
     quotient!(sum, m 3);
     // column 4
-    sum += t[4];
+    sum = sum.wrapping_add(t[4]);
     dot!(sum, m 0 1 2 3, P30 4 3 2 1);
     quotient!(sum, m 4);
     // column 5
-    sum += t[5];
+    sum = sum.wrapping_add(t[5]);
     dot!(sum, m 0 1 2 3 4, P30 5 4 3 2 1);
     quotient!(sum, m 5);
     // column 6
