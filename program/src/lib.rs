@@ -405,6 +405,13 @@ fn process_instruction(
         54 => min_pk_verify_with(payload, hash_to_g2_compact)?,
         55 => min_pk_verify_with(payload, hash_to_g2_compact_xgcd)?,
         56 => min_pk_verify_with(payload, hash_to_g2_compact_parity)?,
+        // Zero-witness hash_to_G2 through big_mod_exp (SIMD-0529): the
+        // payload is the message alone. 58 is its min-pk e2e verify.
+        57 => {
+            let out = bls381_hash::hash_to_g2_modexp(G2_RO, payload)?;
+            set_return_data(&out);
+        }
+        58 => min_pk_verify_with(payload, bls381_hash::hash_to_g2_modexp)?,
         // Witnessed pipeline stage prefixes: payload is stage byte, blob, msg.
         46 => {
             let (&stage, rest) = payload

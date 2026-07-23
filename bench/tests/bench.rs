@@ -616,6 +616,70 @@ fn bench_witness_hash_to_g2_compact_parity() {
     assert!(rejected.program_result.is_err(), "corrupt parity witness was accepted");
 }
 
+// Zero-witness hash_to_G2 through big_mod_exp (SIMD-0529): the payload is
+// the message alone, every root, character and inverse recomputed through
+// the syscall. Pins blst byte-equality and the min-pk e2e verify.
+#[test]
+fn bench_modexp_hash_to_g2() {
+    use blst::min_pk::{AggregatePublicKey, PublicKey, SecretKey, Signature};
+
+    let mollusk = mollusk();
+
+    let result = run(&mollusk, 57, MESSAGE);
+    assert!(
+        !result.program_result.is_err(),
+        "modexp hash_to_g2 failed: {:?}",
+        result.program_result
+    );
+    assert_eq!(result.return_data, blst_hash_g2_serialized(MESSAGE).to_vec(), "differs from blst");
+    println!(
+        "modexp zero-witness hash_to_G2: {} CU (0 witness bytes)",
+        result.compute_units_consumed
+    );
+
+    let keys: Vec<SecretKey> = (0..20u8)
+        .map(|i| {
+            let ikm = [i + 1; 32];
+            SecretKey::key_gen(&ikm, &[]).unwrap()
+        })
+        .collect();
+    let pks: Vec<PublicKey> = keys.iter().map(|s| s.sk_to_pk()).collect();
+    let all_refs: Vec<&PublicKey> = pks.iter().collect();
+    let agg_all = AggregatePublicKey::aggregate(&all_refs, false)
+        .unwrap()
+        .to_public_key();
+    let sigs: Vec<Signature> = keys
+        .iter()
+        .map(|s| s.sign(MESSAGE, DST_G2, &[]))
+        .collect();
+    let sig_refs: Vec<&Signature> = sigs.iter().collect();
+    let agg_sig = blst::min_pk::AggregateSignature::aggregate(&sig_refs, false)
+        .unwrap()
+        .to_signature();
+
+    let mut payload = vec![0u8];
+    payload.extend_from_slice(&agg_all.serialize());
+    payload.extend_from_slice(&agg_sig.compress());
+    payload.extend_from_slice(MESSAGE);
+
+    let result = run(&mollusk, 58, &payload);
+    assert!(
+        !result.program_result.is_err(),
+        "modexp min-pk verify failed: {:?}",
+        result.program_result
+    );
+    println!(
+        "modexp min-pk end-to-end verify k=20: {} CU (0 witness bytes)",
+        result.compute_units_consumed
+    );
+
+    // tampered signature must fail
+    let mut bad = payload.clone();
+    bad[1 + 96 + 10] ^= 1;
+    let rejected = run(&mollusk, 58, &bad);
+    assert!(rejected.program_result.is_err(), "tampered modexp verify was accepted");
+}
+
 // CU spread across messages: the divsteps batch count varies with the
 // input (typical convergence ~27-28 of the 37-batch cap), so the parity
 // hash cost moves a little per message. Also pins blst byte-equality

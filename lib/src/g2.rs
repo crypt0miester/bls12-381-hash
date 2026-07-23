@@ -13,10 +13,12 @@ use alloc::vec::Vec;
 
 use crate::fp2::*;
 use crate::fp::{split_witness,
-    add_mod, add_unreduced, be_to_limbs, from_mont, inv_divsteps, limbs_to_be,
-    mont_mul, mont_sqr, neg_mod, sub_mod, sys, to_mont, wit48, Fp,
+    add_mod, add_unreduced, be_to_limbs, from_mont, inv_divsteps, is_zero, limbs_to_be,
+    modexp_bytes, mont_mul, mont_sqr, neg_mod, sub_mod, sys, to_mont, wit48, Fp,
 };
-use crate::consts_g1::R3;
+use crate::consts_g1::{MODULUS, R3};
+#[cfg(not(feature = "wide-witness"))]
+use crate::consts_g1::R;
 use crate::g1::check_inverse;
 use crate::consts_g2::{
     C256_MONT, ISO3A_XDEN, ISO3A_XNUM, ISO3A_YDEN, ISO3A_YNUM,
@@ -35,16 +37,19 @@ const POINT: usize = 192;
 //
 // Where an inverse feeds exactly one product (the E' slope, the iso-3
 // output coordinates) the result is witnessed instead and pinned with a
-// single multiply. 
+// single multiply. The default tv2 witness is one Fp element,
+// w = (norm(tv2_0) norm(tv2_1))^-1: norms are squarings, so the check and
+// unpacking run cheaper than the old Fp2 pair inversion and the blob
+// drops 48 bytes with it.
 #[cfg(feature = "wide-witness")]
 const W_TV2: usize = 2 * 96;
 #[cfg(not(feature = "wide-witness"))]
-const W_TV2: usize = 96;
+const W_TV2: usize = 48;
 const W_TOTAL: usize = 2 * (1 + 96) + W_TV2 + 3 * 96;
 
 // Compile time layout guards: the parse offsets below assume this exact
 // blob shape in both feature configurations.
-const _: () = assert!(W_TOTAL == 578 || W_TOTAL == 674);
+const _: () = assert!(W_TOTAL == 530 || W_TOTAL == 674);
 const _: () = assert!(194 + W_TV2 + 3 * 96 == W_TOTAL);
 
 pub(crate) fn expand_message_xmd_g2(dst: &[u8], msg: &[u8]) -> [[u8; 32]; 8] {
@@ -121,15 +126,21 @@ pub(crate) fn check_inverse2(v: &Fp2, witness_m: &Fp2) -> Result<Fp2, ProgramErr
     Ok(*witness_m)
 }
 
-/// One pair inversion witness pins both tv2 inverses through a single
-/// product check, four mul2 for the smaller blob
+/// One Fp witness pins both tv2 inverses: w = (norm(a) norm(b))^-1 with a
+/// single product check, each inverse assembling as conj over its norm.
+/// A zero anywhere zeroes the product and fails the check.
 #[cfg(not(feature = "wide-witness"))]
 fn check_tv2_inverses(a: &Fp2, b: &Fp2, wit: &[u8]) -> Result<(Fp2, Fp2), ProgramError> {
-    let w = wit96(wit)?;
-    if mul2(&mul2(a, b), &w) != ONE2 {
+    let w = wit48(wit)?;
+    let n0 = norm_fp2(a);
+    let n1 = norm_fp2(b);
+    if mont_mul(&mont_mul(&n0, &n1), &w) != R {
         return Err(ProgramError::InvalidInstructionData);
     }
-    Ok((mul2(&w, b), mul2(&w, a)))
+    Ok((
+        inv2_from_norm(a, &mont_mul(&w, &n1)),
+        inv2_from_norm(b, &mont_mul(&w, &n0)),
+    ))
 }
 
 /// Two direct inverse witnesses, two mul2 for 96 more blob bytes
@@ -192,7 +203,8 @@ fn sswu_finish(
     flag: u8,
     y_w: &Fp2,
 ) -> Result<Point2, ProgramError> {
-    let x1 = mul2(&fp2(&SSWU2_C1_NEG_B_OVER_A), &add2(&ONE2, inv));
+    // the sum feeds mul2 unreduced (inv is canonical, so it stays below 2p)
+    let x1 = mul2(&fp2(&SSWU2_C1_NEG_B_OVER_A), &add2_unreduced(&ONE2, inv));
 
     // gx2 = (Z u^2)^3 gx1 with Z a non-residue, so gx1 and gx2 always have
     // opposite quadratic characters: one sqrt witness proves its own branch.
@@ -215,12 +227,19 @@ fn sswu_finish(
 
     // The sqrt witness arrives in Montgomery form (a redc to read its sign
     // is cheaper than a to_mont to square-check it); negation commutes with
-    // the Montgomery map, so the sign fix applies to the form we keep.
-    let y_c = from_mont2(y_w);
+    // the Montgomery map, so the sign fix applies to the form we keep. The
+    // sign read needs only c0's parity; c1 breaks the measure-zero c0 == 0
+    // tie, so its redc is paid on that branch alone.
+    let c0_c = from_mont(&y_w.c0);
     if sq2(y_w) != gx {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let y = if sgn0_fp2(&y_c) != sgn0_fp2(&u.canonical) {
+    let sign = if is_zero(&c0_c) {
+        from_mont(&y_w.c1)[0] & 1 == 1
+    } else {
+        c0_c[0] & 1 == 1
+    };
+    let y = if sign != sgn0_fp2(&u.canonical) {
         neg2(y_w)
     } else {
         *y_w
@@ -261,6 +280,58 @@ fn m12(a: &Fp) -> Fp {
     add_mod(&add_mod(&a4, &a4), &a4)
 }
 
+/// Multiply by 18 = 16 + 2.
+#[inline(always)]
+fn m18(a: &Fp) -> Fp {
+    let a2 = add_mod(a, a);
+    let a4 = add_mod(&a2, &a2);
+    let a8 = add_mod(&a4, &a4);
+    add_mod(&add_mod(&a8, &a8), &a2)
+}
+
+/// Multiply by 72 = 64 + 8.
+#[inline(always)]
+fn m72(a: &Fp) -> Fp {
+    let a2 = add_mod(a, a);
+    let a4 = add_mod(&a2, &a2);
+    let a8 = add_mod(&a4, &a4);
+    let a16 = add_mod(&a8, &a8);
+    let a32 = add_mod(&a16, &a16);
+    add_mod(&add_mod(&a32, &a32), &a8)
+}
+
+/// Multiply by 27 = 24 + 3.
+#[inline(always)]
+fn m27(a: &Fp) -> Fp {
+    let a2 = add_mod(a, a);
+    let a3 = add_mod(&a2, a);
+    let a6 = add_mod(&a3, &a3);
+    let a12 = add_mod(&a6, &a6);
+    add_mod(&add_mod(&a12, &a12), &a3)
+}
+
+/// Multiply by 216 = 8 * 27.
+#[inline(always)]
+fn m216(a: &Fp) -> Fp {
+    let t = m27(a);
+    let t = add_mod(&t, &t);
+    let t = add_mod(&t, &t);
+    add_mod(&t, &t)
+}
+
+/// Multiply by 3456 = 128 * 27.
+#[inline(always)]
+fn m3456(a: &Fp) -> Fp {
+    let t = m27(a);
+    let t = add_mod(&t, &t);
+    let t = add_mod(&t, &t);
+    let t = add_mod(&t, &t);
+    let t = add_mod(&t, &t);
+    let t = add_mod(&t, &t);
+    let t = add_mod(&t, &t);
+    add_mod(&t, &t)
+}
+
 /// One adapted cubic (x + g)(x^2 + q1) + q0 at x with xsq = x^2; the sums
 /// ride unreduced, every one a mul2 operand or checked via mul2.
 #[inline(always)]
@@ -271,12 +342,30 @@ fn iso3_cubic(x: &Fp2, xsq: &Fp2, k: &[[[u64; 6]; 2]]) -> Fp2 {
     )
 }
 
+/// Scale by a real constant (c1 = 0): two multiplies against mul2's three.
+#[inline(always)]
+fn mul2_by_fp(a: &Fp2, k: &Fp) -> Fp2 {
+    Fp2 {
+        c0: mont_mul(&a.c0, k),
+        c1: mont_mul(&a.c1, k),
+    }
+}
+
+// Both iso-3 numerator leading coefficients are real; mul2_by_fp relies on it.
+const _: () = {
+    let mut i = 0;
+    while i < 6 {
+        assert!(ISO3A_XNUM[3][1][i] == 0 && ISO3A_YNUM[3][1][i] == 0);
+        i += 1;
+    }
+};
+
 /// The iso-3 numerator pair at x given xsq = x^2: the adapted cubics times
-/// their leading coefficients.
+/// their leading coefficients, both real.
 #[inline(always)]
 fn iso3_numerators(x: &Fp2, xsq: &Fp2) -> (Fp2, Fp2) {
-    let x_num = mul2(&iso3_cubic(x, xsq, &ISO3A_XNUM), &fp2(&ISO3A_XNUM[3]));
-    let y_num = mul2(&iso3_cubic(x, xsq, &ISO3A_YNUM), &fp2(&ISO3A_YNUM[3]));
+    let x_num = mul2_by_fp(&iso3_cubic(x, xsq, &ISO3A_XNUM), &ISO3A_XNUM[3][0]);
+    let y_num = mul2_by_fp(&iso3_cubic(x, xsq, &ISO3A_YNUM), &ISO3A_YNUM[3][0]);
     (x_num, y_num)
 }
 
@@ -377,22 +466,35 @@ pub(crate) fn g2_validate(p: &[u8; POINT]) -> Result<(), ProgramError> {
     Ok(())
 }
 
-fn neg_point(p: &[u8; POINT]) -> [u8; POINT] {
-    let (x, y) = parse_point(p);
-    point_bytes(&x, &neg2(&y))
-}
-
-/// [|x|]Q then negate, matching mul_by_x with BLS_X negative.
-fn mul_by_x(q: &[u8; POINT]) -> Result<[u8; POINT], ProgramError> {
+/// [k]Q by double-and-add over the add syscall; both chain scalars are
+/// 64-bit and sparse. BLS x is negative, and the caller folds the sign
+/// into its combination instead of negating any chain output.
+#[inline(always)]
+fn mul_by_chain(q: &[u8; POINT], k: u64) -> Result<[u8; POINT], ProgramError> {
     let mut acc = *q;
     for bit in (0..63).rev() {
         acc = g2_add(&acc, &acc)?;
-        if (BLS_X_ABS >> bit) & 1 == 1 {
+        if (k >> bit) & 1 == 1 {
             acc = g2_add(&acc, q)?;
         }
     }
-    Ok(neg_point(&acc))
+    Ok(acc)
 }
+
+// psi's y constant is c * (1 - i): the table halves sum to the modulus.
+// The two-multiply form below relies on it.
+const _: () = {
+    let mut carry = 0u64;
+    let mut i = 0;
+    while i < 6 {
+        let (s, o1) = PSI_Y[0][i].overflowing_add(PSI_Y[1][i]);
+        let (s, o2) = s.overflowing_add(carry);
+        assert!(s == MODULUS[i]);
+        carry = o1 as u64 + o2 as u64;
+        i += 1;
+    }
+    assert!(carry == 0);
+};
 
 /// psi(x, y) = (conj(x) * (0, k_x), conj(y) * k_y). Constants are Montgomery,
 /// coordinates canonical, so the mixed-domain products come out canonical.
@@ -403,8 +505,11 @@ fn psi(p: &[u8; POINT]) -> [u8; POINT] {
         c0: mont_mul(&x.c1, &PSI_X_C1),
         c1: mont_mul(&x.c0, &PSI_X_C1),
     };
-    let y_conj = Fp2 { c0: y.c0, c1: neg_mod(&y.c1) };
-    let y_out = mul2(&y_conj, &fp2(&PSI_Y));
+    // conj(y) * c(1 - i) = c ((a - b) - (a + b) i): two multiplies
+    let y_out = Fp2 {
+        c0: mont_mul(&sub_mod(&y.c0, &y.c1), &PSI_Y[0]),
+        c1: neg_mod(&mont_mul(&add_mod(&y.c0, &y.c1), &PSI_Y[0])),
+    };
     point_bytes(&x_out, &y_out)
 }
 
@@ -418,19 +523,19 @@ fn psi2(p: &[u8; POINT]) -> [u8; POINT] {
     point_bytes(&x_out, &neg2(&y))
 }
 
-/// Budroni-Pintore cofactor clearing, term for term as in the reference:
-/// psi^2(2P) + [x^2 - x - 1]P + [x - 1]psi(P).
+/// Budroni-Pintore cofactor clearing, the reference terms
+/// psi^2(2P) + [x^2 - x - 1]P + [x - 1]psi(P) regrouped over |x| = -x:
+/// with A = [|x|]P and B = A - psi(P) the sum is psi^2(2P) + [|x| + 1]B - P
+/// ([|x|]B + A - psi(P) = [|x|]B + B), so no chain output needs negating
+/// and the second chain absorbs two of the trailing adds into one.
 pub(crate) fn clear_cofactor(p: &[u8; POINT]) -> Result<[u8; POINT], ProgramError> {
-    let t1 = mul_by_x(p)?;
+    let a = mul_by_chain(p, BLS_X_ABS)?;
     let t2 = psi(p);
     let p2 = psi2(&g2_add(p, p)?);
-    let s2 = mul_by_x(&g2_add(&t1, &t2)?)?;
+    let t = mul_by_chain(&g2_sub(&a, &t2)?, BLS_X_ABS + 1)?;
 
-    let mut r = g2_add(&p2, &s2)?;
-    r = g2_sub(&r, &t1)?;
-    r = g2_sub(&r, &t2)?;
-    r = g2_sub(&r, p)?;
-    Ok(r)
+    let r = g2_add(&p2, &t)?;
+    g2_sub(&r, p)
 }
 
 
@@ -529,11 +634,12 @@ pub fn hash_to_g2_prefix(dst: &[u8], stage: u8, payload: &[u8]) -> Result<Vec<u8
 // Two ideas shrink the blob. A square root over Fp2 travels as its real
 // part alone: with gx = g0 + g1 i and y = c0 + c1 i, the imaginary half of
 // y^2 == gx forces c1 = g1 / (2 c0), so shipping c0 and checking the real
-// half (c0^2 - c1^2 == g0) pins the root. And every inverse the pipeline
-// needs -- the two tv2 inverses, the two 2c0 divisors, and per map the
-// iso-3 denominator pair -- collapses into one Montgomery batch: the blob
-// carries a single Fp witness w = (e1 ... e8)^-1 whose product check pins
-// every unpacked inverse. Fp2 inverses ride their norms (inv z =
+// half (denominator-cleared: (2c0^2 + g1)(2c0^2 - g1) == 4 g0 c0^2) pins
+// the root. And every inverse the pipeline needs -- the two tv2 inverses
+// and per map the iso-3 denominator pair, with the root's 2c0 divisor
+// fused into its yden element -- collapses into one Montgomery batch: the
+// blob carries a single Fp witness w = (e1 ... e6)^-1 whose product check
+// pins every unpacked inverse. Fp2 inverses ride their norms (inv z =
 // conj z / norm z, and norm z = 0 only at z = 0 since -1 is a non-residue),
 // so the batch stays in Fp.
 //
@@ -631,30 +737,50 @@ fn compact_map_parts(pre: &SswuPre, flag: u8) -> MapParts {
     let dcb = mul2(&dsq, d);
     let nsq = sq2(&n);
     let nd = mul2(&n, d);
-    // sums ride unreduced: they feed mont_sqr norms and inv2_from_norm
-    // xden_h = n^2 + (12 - 12i) n d + k0 d^2
+    // sums ride unreduced: they feed mont_sqr norms and inv2_from_norm.
+    // Every denominator coefficient is a tiny integer, so the homogenized
+    // constant products are addition chains instead of mul2 calls.
+    // xden_h = n^2 + (12 - 12i) n d - 72i d^2
     let k1nd = Fp2 {
         c0: m12(&add_mod(&nd.c0, &nd.c1)),
         c1: m12(&sub_mod(&nd.c1, &nd.c0)),
     };
-    let xden_h = add2_unreduced(&add2_unreduced(&nsq, &k1nd), &mul2(&fp2(&ISO3A_XDEN[1]), &dsq));
-    // the adapted monic cubic (x + g)(x^2 + q1) + q0, homogenized
+    let k0dsq = Fp2 {
+        c0: m72(&dsq.c1),
+        c1: neg_mod(&m72(&dsq.c0)),
+    };
+    let xden_h = add2_unreduced(&add2_unreduced(&nsq, &k1nd), &k0dsq);
+    // the adapted monic cubic (x + g)(x^2 + q1) + q0, homogenized, with
+    // g = 18 - 18i, q1 = -216i, q0 = 3456(1 + i)
+    let gd = Fp2 {
+        c0: m18(&add_mod(&d.c0, &d.c1)),
+        c1: m18(&sub_mod(&d.c1, &d.c0)),
+    };
+    let q1dsq = Fp2 {
+        c0: m216(&dsq.c1),
+        c1: neg_mod(&m216(&dsq.c0)),
+    };
+    let q0dcb = Fp2 {
+        c0: m3456(&sub_mod(&dcb.c0, &dcb.c1)),
+        c1: m3456(&add_mod(&dcb.c0, &dcb.c1)),
+    };
     let yden_h = add2_unreduced(
-        &mul2(
-            &add2_unreduced(&n, &mul2(&fp2(&ISO3A_YDEN[0]), d)),
-            &add2_unreduced(&nsq, &mul2(&fp2(&ISO3A_YDEN[1]), &dsq)),
-        ),
-        &mul2(&fp2(&ISO3A_YDEN[2]), &dcb),
+        &mul2(&add2_unreduced(&n, &gd), &add2_unreduced(&nsq, &q1dsq)),
+        &q0dcb,
     );
     MapParts { n, dsq, dcb, xden_h, yden_h }
 }
 
 /// The per-map denominators after batch unpacking, bundled for the tail.
+/// The yden slot is fused: it holds the inverse of norm(yden_h) * 2c0, so
+/// the y output picks up the root's 1/(2 c0) and the batch never carries
+/// the bare divisor.
 struct IsoDen<'a> {
     dsq: &'a Fp2,
     dcb: &'a Fp2,
     inv_xden: Fp2,
-    inv_yden: Fp2,
+    yden_h: &'a Fp2,
+    inv_yden_2c0: Fp,
 }
 
 /// One map's tail: recover the sqrt from its real part, fix the sign, and
@@ -665,7 +791,6 @@ fn sswu_iso_compact(
     x: &Fp2,
     flag: u8,
     c0: &Fp,
-    inv_2c0: &Fp,
     den: &IsoDen,
 ) -> Result<[u8; POINT], ProgramError> {
     let xsq = sq2(x);
@@ -678,23 +803,37 @@ fn sswu_iso_compact(
 
     // c1 = g1 / (2 c0) satisfies the imaginary half of y^2 == gx by
     // construction; the real half, as a difference of squares, is the
-    // remaining unique-answer check
-    let c1 = mont_mul(&gx.c1, inv_2c0);
-    if mont_mul(&add_unreduced(c0, &c1), &sub_mod(c0, &c1)) != gx.c0 {
+    // remaining unique-answer check. It rides denominator-cleared so no
+    // bare 1/(2 c0) is ever needed: with s = 2 c0^2 = c0 * (2 c0) the
+    // check is (s + g1)(s - g1) == g0 (2 c0)^2, and (2 c0)^2 = 2 s.
+    let ssq = mont_sqr(c0);
+    let s = add_mod(&ssq, &ssq);
+    let d2 = add_mod(&s, &s);
+    if mont_mul(&add_unreduced(&s, &gx.c1), &sub_mod(&s, &gx.c1)) != mont_mul(&gx.c0, &d2) {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let y_m = Fp2 { c0: *c0, c1 };
-    // c0 != 0 (its double is a batch element), so sgn0(y) is c0's parity
-    let y = if (from_mont(c0)[0] & 1 == 1) != sgn0_fp2(&u.canonical) {
-        neg2(&y_m)
+    // y scaled by 2 c0: (c0, c1) * 2 c0 = (s, g1), the numerator the fused
+    // yden slot divides back out. c0 != 0 (the fused batch element carries
+    // its double), so sgn0(y) is c0's parity.
+    let num_y = Fp2 { c0: s, c1: gx.c1 };
+    let num_y = if (from_mont(c0)[0] & 1 == 1) != sgn0_fp2(&u.canonical) {
+        neg2(&num_y)
     } else {
-        y_m
+        num_y
     };
 
     // numerators only: the denominators arrived through the batch
     let (x_num, y_num) = iso3_numerators(x, &xsq);
     let x_out = mul2(&mul2(&x_num, den.dsq), &den.inv_xden);
-    let y_out = mul2(&mul2(&mul2(&y, &y_num), den.dcb), &den.inv_yden);
+    // y_out = (2 c0 y) y_num dcb conj(yden_h) / (norm(yden_h) 2 c0): the
+    // conjugation rides the reduced operand (conj(conj(a) b) == a conj(b),
+    // and yden_h is unreduced), the fused Fp slot scales last
+    let t = mul2(&mul2(&num_y, &y_num), den.dcb);
+    let v = mul2(&Fp2 { c0: t.c0, c1: neg_mod(&t.c1) }, den.yden_h);
+    let y_out = Fp2 {
+        c0: mont_mul(&v.c0, &den.inv_yden_2c0),
+        c1: neg_mod(&mont_mul(&v.c1, &den.inv_yden_2c0)),
+    };
     Ok(point_bytes(&from_mont2(&x_out), &from_mont2(&y_out)))
 }
 
@@ -748,29 +887,29 @@ fn hash_to_g2_compact_inner(
         compact_map_parts(&pre[1], (flags >> 1) & 1),
     ];
 
-    // after the in-place batch these hold the inverses, element for element
+    // after the in-place batch these hold the inverses, element for element;
+    // each root's 2c0 divisor rides fused into its map's yden element
     let mut inv = [
-        add_unreduced(&c0s[0], &c0s[0]),
-        add_unreduced(&c0s[1], &c0s[1]),
         norm_fp2(&pre[0].tv2),
         norm_fp2(&pre[1].tv2),
         norm_fp2(&parts[0].xden_h),
-        norm_fp2(&parts[0].yden_h),
+        mont_mul(&norm_fp2(&parts[0].yden_h), &add_unreduced(&c0s[0], &c0s[0])),
         norm_fp2(&parts[1].xden_h),
-        norm_fp2(&parts[1].yden_h),
+        mont_mul(&norm_fp2(&parts[1].yden_h), &add_unreduced(&c0s[1], &c0s[1])),
     ];
     batch_inverse(&mut inv, w)?;
 
     let mut points = [[0u8; POINT]; 2];
     for i in 0..2 {
-        let x = mul2(&parts[i].n, &inv2_from_norm(&pre[i].tv2, &inv[2 + i]));
+        let x = mul2(&parts[i].n, &inv2_from_norm(&pre[i].tv2, &inv[i]));
         let den = IsoDen {
             dsq: &parts[i].dsq,
             dcb: &parts[i].dcb,
-            inv_xden: inv2_from_norm(&parts[i].xden_h, &inv[4 + 2 * i]),
-            inv_yden: inv2_from_norm(&parts[i].yden_h, &inv[5 + 2 * i]),
+            inv_xden: inv2_from_norm(&parts[i].xden_h, &inv[2 + 2 * i]),
+            yden_h: &parts[i].yden_h,
+            inv_yden_2c0: inv[3 + 2 * i],
         };
-        points[i] = sswu_iso_compact(&u[i], &x, (flags >> i) & 1, &c0s[i], &inv[i], &den)?;
+        points[i] = sswu_iso_compact(&u[i], &x, (flags >> i) & 1, &c0s[i], &den)?;
     }
 
     let sum = g2_add(&points[0], &points[1])?;
@@ -778,6 +917,167 @@ fn hash_to_g2_compact_inner(
     g2_validate(&cleared)?;
     Ok(cleared.to_vec())
 }
+
+#[cfg(feature = "modexp")]
+mod modexp_g2 {
+    use super::*;
+    use crate::fp::{exp_inverse, exp_legendre, exp_sqrt, half_mod, is_one, is_zero, modexp};
+
+    struct Exps {
+        inv: [u8; 48],
+        legendre: [u8; 48],
+        sqrt: [u8; 48],
+    }
+
+    /// Fp2 inverse via the norm trick: the Montgomery-form norm feeds the
+    /// syscall as is ((nR)^(p-2) = n^-1 R^-1) and the R3 multiply returns
+    /// the result to the Montgomery domain, skipping the from_mont.
+    fn inv2_modexp(z: &Fp2, exps: &Exps) -> Result<Fp2, ProgramError> {
+        let n = norm_fp2(z);
+        if is_zero(&n) {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let n_inv = mont_mul(&modexp(&n, &exps.inv)?, &R3);
+        Ok(Fp2 {
+            c0: mont_mul(&z.c0, &n_inv),
+            c1: neg_mod(&mont_mul(&z.c1, &n_inv)),
+        })
+    }
+
+    /// Squareness of an Fp2 element as the Legendre character of its norm;
+    /// R = 2^390 is a square, so the Montgomery form feeds the syscall as is.
+    fn is_square2_modexp(z: &Fp2, exps: &Exps) -> Result<bool, ProgramError> {
+        Ok(is_one(&modexp(&norm_fp2(z), &exps.legendre)?))
+    }
+
+    /// Fp2 square root by the norm trick, plus the canonical parity of its
+    /// real half (free here, sparing the caller a from_mont2 sign read: the
+    /// nonzero imaginary part forces c0 != 0, so sgn0 is that parity alone).
+    /// The input must be a square, its branch selected by character.
+    fn sqrt2_modexp(gx: &Fp2, exps: &Exps) -> Result<(Fp2, bool), ProgramError> {
+        if is_zero(&gx.c1) {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let g0 = from_mont(&gx.c0);
+        let delta = modexp(&from_mont(&norm_fp2(gx)), &exps.sqrt)?;
+        // exactly one of (g0 +- delta)/2 is a square: their product is
+        // -(g1/2)^2 and -1 is a non-residue
+        let mut t = half_mod(&add_mod(&g0, &delta));
+        if !is_one(&modexp(&t, &exps.legendre)?) {
+            t = half_mod(&sub_mod(&g0, &delta));
+        }
+        // c1 = g1 / (2 c0); g1 != 0 forces t != 0, so c0 != 0
+        let c0 = modexp(&t, &exps.sqrt)?;
+        let inv_2c0 = to_mont(&modexp(&add_mod(&c0, &c0), &exps.inv)?);
+        let root = Fp2 {
+            c0: to_mont(&c0),
+            c1: mont_mul(&gx.c1, &inv_2c0),
+        };
+        Ok((root, c0[0] & 1 == 1))
+    }
+
+    /// One SSWU map: branch by character, root by norm trick, sign by sgn0.
+    fn map_to_curve(u: &Elem2, exps: &Exps) -> Result<Point2, ProgramError> {
+        let pre = sswu_pre(u)?;
+        let inv = inv2_modexp(&pre.tv2, exps)?;
+        let x1 = mul2(&fp2(&SSWU2_C1_NEG_B_OVER_A), &add2_unreduced(&ONE2, &inv));
+        let gx1 = gx2_at(&x1);
+        // is_square(0) is true, so gx1 == 0 takes the x1 branch to match blst
+        let (x, gx) = if is_zero2(&gx1) || is_square2_modexp(&gx1, exps)? {
+            (x1, gx1)
+        } else {
+            let x2 = mul2(&pre.xi_usq, &x1);
+            (x2, gx2_at(&x2))
+        };
+        let (y_m, sign) = sqrt2_modexp(&gx, exps)?;
+        let y = if sign != sgn0_fp2(&u.canonical) {
+            neg2(&y_m)
+        } else {
+            y_m
+        };
+        Ok(Point2 { x, y })
+    }
+
+    /// Affine addition on E' (variable time; errors on the infinity outcome).
+    fn add_prime(p: &Point2, q: &Point2, exps: &Exps) -> Result<Point2, ProgramError> {
+        let lambda = if p.x == q.x {
+            if p.y != q.y || is_zero2(&p.y) {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            // doubling: (3x^2 + A') / 2y
+            let xsq = sq2(&p.x);
+            let num = add2(&add2(&add2(&xsq, &xsq), &xsq), &mul_by_a2i(&p.x));
+            let den = add2(&p.y, &p.y);
+            mul2(&num, &inv2_modexp(&den, exps)?)
+        } else {
+            let num = sub2(&q.y, &p.y);
+            let den = sub2(&q.x, &p.x);
+            mul2(&num, &inv2_modexp(&den, exps)?)
+        };
+        let x3 = sub2(&sub2(&sq2(&lambda), &p.x), &q.x);
+        let y3 = sub2(&mul2(&lambda, &sub2(&p.x, &x3)), &p.y);
+        Ok(Point2 { x: x3, y: y3 })
+    }
+
+    /// 3-isogeny to E with a direct inverse per denominator: sharing one
+    /// behind the pair product costs more multiplies than the saved syscall
+    /// round trip, the same arithmetic that rejects batching the norms.
+    fn iso_map(p: &Point2, exps: &Exps) -> Result<[u8; POINT], ProgramError> {
+        let (x_num, x_den, y_num, y_den) = iso3_adapted(&p.x);
+        if is_zero2(&x_den) || is_zero2(&y_den) {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let x_out = mul2(&x_num, &inv2_modexp(&x_den, exps)?);
+        let y_out = mul2(&mul2(&p.y, &y_num), &inv2_modexp(&y_den, exps)?);
+        Ok(point_bytes(&from_mont2(&x_out), &from_mont2(&y_out)))
+    }
+
+    /// hash_to_field with the 64-byte reductions through the syscall at
+    /// exponent one, like the G1 modexp path: one flat call against the
+    /// fold multiply.
+    fn hash_to_field_g2_modexp(dst: &[u8], msg: &[u8]) -> Result<[Elem2; 2], ProgramError> {
+        let blocks = expand_message_xmd_g2(dst, msg);
+        let mut wide = [0u8; 64];
+        let mut fold = |hi: &[u8; 32], lo: &[u8; 32]| -> Result<(Fp, Fp), ProgramError> {
+            wide[..32].copy_from_slice(hi);
+            wide[32..].copy_from_slice(lo);
+            let canonical = be_to_limbs(&modexp_bytes(&wide, &[1u8])?);
+            Ok((canonical, to_mont(&canonical)))
+        };
+        let mut elems = [
+            Elem2 { canonical: Fp2 { c0: ZERO, c1: ZERO }, mont: Fp2 { c0: ZERO, c1: ZERO } },
+            Elem2 { canonical: Fp2 { c0: ZERO, c1: ZERO }, mont: Fp2 { c0: ZERO, c1: ZERO } },
+        ];
+        for (i, elem) in elems.iter_mut().enumerate() {
+            let (c0, m0) = fold(&blocks[i * 4], &blocks[i * 4 + 1])?;
+            let (c1, m1) = fold(&blocks[i * 4 + 2], &blocks[i * 4 + 3])?;
+            elem.canonical = Fp2 { c0, c1 };
+            elem.mont = Fp2 { c0: m0, c1: m1 };
+        }
+        Ok(elems)
+    }
+
+    /// Zero-witness hash_to_g2: the payload is the message alone. Needs the
+    /// big_mod_exp syscall (SIMD-0529).
+    pub fn hash_to_g2_modexp(dst: &[u8], msg: &[u8]) -> Result<Vec<u8>, ProgramError> {
+        let exps = Exps {
+            inv: exp_inverse(),
+            legendre: exp_legendre(),
+            sqrt: exp_sqrt(),
+        };
+        let u = hash_to_field_g2_modexp(dst, msg)?;
+        let p0 = map_to_curve(&u[0], &exps)?;
+        let p1 = map_to_curve(&u[1], &exps)?;
+        let sum = add_prime(&p0, &p1, &exps)?;
+        let uncleared = iso_map(&sum, &exps)?;
+        let cleared = clear_cofactor(&uncleared)?;
+        g2_validate(&cleared)?;
+        Ok(cleared.to_vec())
+    }
+}
+
+#[cfg(feature = "modexp")]
+pub use modexp_g2::hash_to_g2_modexp;
 
 /// Host-side witness generation mirroring the on-chain pipeline.
 #[cfg(not(target_os = "solana"))]
@@ -928,8 +1228,7 @@ pub mod witness {
         let u = hash_to_field_g2(crate::dst::G2_RO, msg);
         let pre = [sswu_pre(&u[0]).unwrap(), sswu_pre(&u[1]).unwrap()];
 
-        let w_tv2 = inv2(&mul2(&pre[0].tv2, &pre[1].tv2));
-        let invs = [mul2(&w_tv2, &pre[1].tv2), mul2(&w_tv2, &pre[0].tv2)];
+        let invs = [inv2(&pre[0].tv2), inv2(&pre[1].tv2)];
 
         let mut flags = [0u8; 2];
         let mut ys = [Fp2 { c0: ZERO, c1: ZERO }; 2];
@@ -960,7 +1259,13 @@ pub mod witness {
         blob.push(flags[1]);
         push_fp2_mont(&mut blob, &ys[1]);
         #[cfg(not(feature = "wide-witness"))]
-        push_fp2_mont(&mut blob, &w_tv2);
+        {
+            let w = inv_fp(&mont_mul(
+                &norm_fp2(&pre[0].tv2),
+                &norm_fp2(&pre[1].tv2),
+            ));
+            blob.extend_from_slice(&limbs_to_be(&w));
+        }
         #[cfg(feature = "wide-witness")]
         {
             push_fp2_mont(&mut blob, &invs[0]);
@@ -1006,13 +1311,12 @@ pub mod witness {
             flags |= flag << i;
             blob.extend_from_slice(&limbs_to_be(&y.c0));
 
-            // the product is order-independent, so just fold the four
-            // per-map batch elements in as they appear
+            // the product is order-independent, so just fold the three
+            // per-map batch elements in as they appear (2c0 fused into yden)
             let parts = compact_map_parts(&pre[i], flag);
-            prod = mont_mul(&prod, &add_mod(&y.c0, &y.c0));
             prod = mont_mul(&prod, &norm_fp2(&pre[i].tv2));
             prod = mont_mul(&prod, &norm_fp2(&parts.xden_h));
-            prod = mont_mul(&prod, &norm_fp2(&parts.yden_h));
+            prod = mont_mul(&prod, &mont_mul(&norm_fp2(&parts.yden_h), &add_mod(&y.c0, &y.c0)));
         }
         blob[0] = flags;
         (blob, prod)

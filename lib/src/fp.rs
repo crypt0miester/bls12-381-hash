@@ -4,7 +4,7 @@
 
 use solana_program_error::ProgramError;
 
-use crate::consts_g1::{INV, MODULUS, R2};
+use crate::consts_g1::{INV, MODULUS, R2, R3};
 use crate::macros::{dot, lane, quotient, row_limbs, row_limbs_fold, row_limbs_modp};
 
 pub(crate) type Fp = [u64; 6];
@@ -231,9 +231,12 @@ pub(crate) fn modexp(base: &Fp, exp: &[u8; 48]) -> Result<Fp, ProgramError> {
     Ok(be_to_limbs(&modexp_bytes(&limbs_to_be(base), exp)?))
 }
 
-/// Inverse of a Montgomery-form element, returned in Montgomery form.
+/// Inverse of a Montgomery-form element, returned in Montgomery form: the
+/// Montgomery representative feeds the syscall as is ((aR)^(p-2) =
+/// a^-1 R^-1) and the R3 multiply returns to the domain, skipping the
+/// from_mont a canonical round trip would pay.
 pub(crate) fn inverse_mont(a: &Fp, exp_inv: &[u8; 48]) -> Result<Fp, ProgramError> {
-    Ok(to_mont(&modexp(&from_mont(a), exp_inv)?))
+    Ok(mont_mul(&modexp(a, exp_inv)?, &R3))
 }
 
 #[inline(always)]
@@ -358,7 +361,7 @@ fn divsteps30(mut eta: i64, f0: i64, g0: i64) -> (i64, i64, i64, i64, i64) {
 /// stores), which ends the outer loop early: once g == 0 every further
 /// batch is the identity on f, d and e (matrix [[2^30, 0], [0, 1]],
 /// cancelled by the shared division).
-#[inline(never)]
+#[inline(always)]
 fn update_fg(f: &S13, g: &mut S13, fout: &mut S13, u: i64, v: i64, q: i64, r: i64) -> bool {
     let mut cf = u.wrapping_mul(f[0]).wrapping_add(v.wrapping_mul(g[0]));
     debug_assert!(cf & M30S == 0);
@@ -380,7 +383,7 @@ fn update_fg(f: &S13, g: &mut S13, fout: &mut S13, u: i64, v: i64, q: i64, r: i6
 /// in for negative d/e, keeping both in (-2p, p). Two row passes like
 /// update_fg; the head quotients need the old d[0] and e[0], so both are
 /// fixed before either pass stores.
-#[inline(never)]
+#[inline(always)]
 fn update_de(d: &S13, e: &mut S13, dout: &mut S13, u: i64, v: i64, q: i64, r: i64) {
     let sd = d[12] >> 63;
     let se = e[12] >> 63;

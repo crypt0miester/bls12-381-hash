@@ -35,8 +35,8 @@ let witness = bls381_hash::witness::g2::generate_compact_parity(message);
 | `ro` (default) | `g1-ro` + `g2-ro`, the blst-compatible pair |
 | `g1-ro`, `g2-ro` | standard `_SSWU_RO_POP_` pipelines; `g2-ro` includes the compact, xgcd and parity blob layouts |
 | `g1-nu`, `g2-nu` | RFC 9380 encode_to_curve variants; not random-oracle suites, see the NU note in BENCHMARKS.md |
-| `modexp` | big_mod_exp-assisted G1 path, needs SIMD-0529 |
-| `wide-witness` | 674 B G2 blob, ~14k CU cheaper; for 4 KiB (SIMD-0296) transactions |
+| `modexp` | big_mod_exp-assisted zero-witness G1 and G2 paths, need SIMD-0529 |
+| `wide-witness` | 674 B G2 blob, ~7k CU cheaper; for 4 KiB (SIMD-0296) transactions |
 | `full` | everything above |
 
 The `lib/` crate (`bls381-hash`) is the product; `program/` is an SBF
@@ -48,15 +48,16 @@ Measured with mollusk 0.13.4 on the agave 4.0 stack, SBF v3:
 
 | pipeline | CU | witness | compatibility |
 |---|---|---|---|
-| hash_to_G1 (RO, min-sig) | ~129k | 338 B | `_SSWU_RO_POP_`, byte-equal to blst |
-| hash_to_G2 (RO, min-pk) | ~253k | 578 B | `_SSWU_RO_POP_`, byte-equal to blst |
-| hash_to_G2 (RO, compact) | ~470k | 145 B | same suite, same output bytes |
-| hash_to_G2 (RO, xgcd) | ~509k | 97 B | same suite, same output bytes |
-| hash_to_G2 (RO, parity) | ~509k | 96 B | same suite, same output bytes |
-| hash_to_G2 (RO, `wide-witness`) | ~241k | 674 B | same suite, bigger blob |
+| hash_to_G1 (RO, min-sig) | ~106k | 338 B | `_SSWU_RO_POP_`, byte-equal to blst |
+| hash_to_G2 (RO, min-pk) | ~203k | 530 B | `_SSWU_RO_POP_`, byte-equal to blst |
+| hash_to_G2 (RO, compact) | ~349k | 145 B | same suite, same output bytes |
+| hash_to_G2 (RO, xgcd) | ~387k | 97 B | same suite, same output bytes |
+| hash_to_G2 (RO, parity) | ~387k | 96 B | same suite, same output bytes |
+| hash_to_G2 (RO, `modexp`) | ~270k | 0 B | same suite, needs SIMD-0529 |
+| hash_to_G2 (RO, `wide-witness`) | ~196k | 674 B | same suite, bigger blob |
 
 An end-to-end min-pk BLS verify (hash_to_G2 plus the pairing syscall) lands
-around 308k CU with the default blob, 525k compact, 564k parity; for scale,
+around 258k CU with the default blob, 404k compact, 443k parity; for scale,
 a naive port of zkcrypto `bls12_381` costs 11.3M CU for G1 and 46.5M CU for
 G2. The NU variants, stage costs, syscall pricing, and the optimization
 notes live in [BENCHMARKS.md](BENCHMARKS.md).
@@ -72,11 +73,13 @@ its witness inline in one legacy transaction, which retires stage-then-
 consume flows entirely, and it is the floor of this witness family (the
 two root halves are pure computational advice for the square roots, and
 sqrt mod p has no multiply-free algorithm). The 145 B blob buys ~39k CU
-back for 49 bytes when the transaction has room; the 578 B blob is the CU
+back for 49 bytes when the transaction has room; the 530 B blob is the CU
 floor for consumers with no byte pressure. All of them run the same checks
 and produce byte-identical output, so the choice is per call site. Once
-SIMD-0529 (`big_mod_exp`) activates, the square-root halves become
-computable on-chain too and the witness drops to zero bytes.
+SIMD-0529 (`big_mod_exp`) activates, the witness drops to zero bytes
+outright: the `modexp` feature ships `hash_to_g2_modexp`, which recomputes
+every root, character and inverse through the syscall at ~270k CU with
+byte-identical output, beating the byte-bound blobs on both axes.
 
 ## Approach
 
@@ -94,7 +97,7 @@ The compact layouts restructure the same checks to cut bytes:
   imaginary half of `y^2 == gx` forces `c1 = g1/(2 c0)`, and the real half,
   checked as `(c0 + c1)(c0 - c1) == g0`, pins the root
 - every inverse the pipeline needs hides behind one 48-byte batched witness
-  `w = (e1...e8)^-1`, pinned by a single product check; Fp2 inverses ride
+  `w = (e1...e6)^-1`, pinned by a single product check; Fp2 inverses ride
   their norms, and a zero anywhere fails the product
 - the xgcd layout drops even that witness: inversion is gcd-shaped, so the
   program recomputes `w` with Bernstein-Yang divsteps over 30-bit lanes
@@ -211,8 +214,11 @@ cd program && cargo build-sbf --arch v3
 cd ../bench && cargo test -- --nocapture
 ```
 
-Requires the Solana platform tools. The standard suites assert byte-equality
-with blst at every stage. A corrupted witness must abort, and supplying the
+Requires the Solana platform tools. `.cargo/config.toml` pins the SBF
+codegen to the register-pressure scheduler (`-pre-RA-sched=list-hybrid`,
+about 17-20% CU on every path, see BENCHMARKS.md); a `RUSTFLAGS`
+environment override silently drops it. The standard suites assert
+byte-equality with blst at every stage. A corrupted witness must abort, and supplying the
 other square root must not change the output point (in the parity layout it
 must abort outright: the root's parity is the branch bit).
 

@@ -100,8 +100,9 @@ fn map_to_curve_sswu(u: &Fp, c_neg_b_over_a: &Fp, exps: &Exps) -> Result<PointPr
         return Err(ProgramError::InvalidInstructionData);
     }
 
+    // the sum feeds mont_mul unreduced (inv_tv2 is canonical, so below 2p)
     let inv_tv2 = inverse_mont(&tv2, &exps.inv)?;
-    let x1 = mont_mul(c_neg_b_over_a, &add_mod(&R, &inv_tv2));
+    let x1 = mont_mul(c_neg_b_over_a, &add_unreduced(&R, &inv_tv2));
 
     let gx = |x: &Fp| -> Fp {
         let xsq = mont_sqr(x);
@@ -109,8 +110,9 @@ fn map_to_curve_sswu(u: &Fp, c_neg_b_over_a: &Fp, exps: &Exps) -> Result<PointPr
         add_mod(&add_mod(&x3, &mont_mul(&SSWU_ELLP_A, x)), &SSWU_ELLP_B)
     };
 
+    // R = 2^390 is a square, so the Montgomery form feeds the syscall as is
     let gx1 = gx(&x1);
-    let legendre = modexp(&from_mont(&gx1), &exps.legendre)?;
+    let legendre = modexp(&gx1, &exps.legendre)?;
 
     // is_square(0) is true, so gx1 == 0 takes the x1 branch to match blst.
     let (x, gx_val) = if is_zero(&gx1) || is_one(&legendre) {
@@ -213,14 +215,10 @@ fn horner(coeffs: &[[u64; 6]], x: &Fp) -> Fp {
 fn iso_map(p: &PointPrime, exps: &Exps) -> Result<([u8; 48], [u8; 48]), ProgramError> {
     let (x_num, x_den, y_num, y_den) = iso11_adapted(&p.x);
 
-    // batch inversion of both denominators
-    let t = mont_mul(&x_den, &y_den);
-    let t_inv = inverse_mont(&t, &exps.inv)?;
-    let x_den_inv = mont_mul(&t_inv, &y_den);
-    let y_den_inv = mont_mul(&t_inv, &x_den);
-
-    let x = mont_mul(&x_num, &x_den_inv);
-    let y = mont_mul(&p.y, &mont_mul(&y_num, &y_den_inv));
+    // direct inverse per denominator: sharing one behind the pair product
+    // costs three multiplies to save one syscall round trip
+    let x = mont_mul(&x_num, &inverse_mont(&x_den, &exps.inv)?);
+    let y = mont_mul(&p.y, &mont_mul(&y_num, &inverse_mont(&y_den, &exps.inv)?));
 
     Ok((limbs_to_be(&from_mont(&x)), limbs_to_be(&from_mont(&y))))
 }
@@ -376,8 +374,9 @@ fn map_to_curve_witnessed(u: &FieldElem, wit: &[u8]) -> Result<PointPrime, Progr
         return Err(ProgramError::InvalidInstructionData);
     }
 
+    // the sum feeds mont_mul unreduced (the witness is canonical, below 2p)
     let inv_m = check_inverse(&tv2, &w_inv)?;
-    let x1 = mont_mul(&SSWU_C1_NEG_B_OVER_A, &add_mod(&R, &inv_m));
+    let x1 = mont_mul(&SSWU_C1_NEG_B_OVER_A, &add_unreduced(&R, &inv_m));
 
     // gx2 = (Z u^2)^3 gx1 with Z a non-residue, so gx1 and gx2 always have
     // opposite quadratic characters: one sqrt witness proves its own branch.

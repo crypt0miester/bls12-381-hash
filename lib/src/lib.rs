@@ -63,6 +63,8 @@ pub use crate::g1::encode_to_g1;
 pub use crate::g2::encode_to_g2;
 #[cfg(feature = "modexp")]
 pub use crate::g1::run as hash_to_g1_modexp;
+#[cfg(all(feature = "modexp", feature = "g2-ro"))]
+pub use crate::g2::hash_to_g2_modexp;
 
 /// Per function CU probes for the bench harness; not part of the API
 #[doc(hidden)]

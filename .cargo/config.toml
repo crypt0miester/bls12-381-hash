@@ -1,0 +1,10 @@
+# The default SelectionDAG scheduler (list-ilp) interleaves independent
+# work to fake instruction-level parallelism; sBPF executes one
+# instruction per CU on ten registers, so that policy only manufactures
+# spills. list-hybrid schedules against register pressure instead: the
+# ps30 multiplier drops ~22% with no source change (mont_mul 1929 -> 1508)
+[target.sbpfv3-solana-solana]
+rustflags = ["-C", "llvm-args=-pre-RA-sched=list-hybrid"]
+
+[target.sbpf-solana-solana]
+rustflags = ["-C", "llvm-args=-pre-RA-sched=list-hybrid"]
