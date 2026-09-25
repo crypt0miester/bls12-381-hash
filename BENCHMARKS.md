@@ -105,7 +105,9 @@ batches, 2026-09-25):
 | hash_to_G2: blst / blstrs / solana-bls-signatures / zkcrypto | 92 / 93 / 95 / 251 |
 | this crate's witness generation: fat / default / parity | 347 / 368 / 292 |
 | field multiply: this crate's ps30 / blst asm | 0.048 / 0.020 |
-| blst Fp2 inverse / Fp2 square root | 1.7 / 14.9 |
+| blst Fp2 inverse / Fp2 square root | 1.7 / 15.0 |
+| blst Fp inverse / Fp square root | 1.6 / 7.3 |
+| 380 dependent blst_fp_sqr: one chain / two / four interleaved | 8.5 / 12.4 / 23.9 |
 | blst sign / verify / 20-signer fast aggregate verify | 188 / 421 / 417 |
 | solana-bls-signatures sign / verify | 182 / 543 |
 
@@ -116,6 +118,11 @@ their time in Fermat square roots and inverses on the portable ps30
 multiplier (about 7,300 multiplies per fat witness). Running the same
 generator on blst's public field API (one Fp2 inverse and one or two Fp2
 square roots per map, one more inverse for sigma) models at ~60 us.
+blst's square root equals one 380-squaring chain and its inverse costs
+about 75 multiplies, so its primitives sit at the M4's latency floor. What
+remains is the generator's own work: two roots per witness in place of ~15
+exponentiations, batched inverses, and the two maps' chains run in
+lockstep (two chains cost 1.5x one), for ~30-40 us.
 
 ## Compact witness layouts
 

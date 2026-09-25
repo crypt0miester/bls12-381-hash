@@ -108,6 +108,59 @@ fn host_speed() {
         });
     }
 
+    println!("exponentiation chains, 380 dependent blst_fp_sqr each");
+    {
+        let seed = |k: u64| {
+            let mut v = blst::blst_fp::default();
+            v.l[0] = k;
+            v
+        };
+        let one = time("one chain", 500, || {
+            let mut a = seed(7);
+            for _ in 0..380 {
+                let t = a;
+                unsafe { blst::blst_fp_sqr(&mut a, &t) };
+            }
+            black_box(a);
+        });
+        let two = time("two chains interleaved", 500, || {
+            let (mut a, mut b) = (seed(7), seed(11));
+            for _ in 0..380 {
+                let (ta, tb) = (a, b);
+                unsafe {
+                    blst::blst_fp_sqr(&mut a, &ta);
+                    blst::blst_fp_sqr(&mut b, &tb);
+                }
+            }
+            black_box((a, b));
+        });
+        let four = time("four chains interleaved", 300, || {
+            let (mut a, mut b, mut c, mut d) = (seed(7), seed(11), seed(13), seed(17));
+            for _ in 0..380 {
+                let (ta, tb, tc, td) = (a, b, c, d);
+                unsafe {
+                    blst::blst_fp_sqr(&mut a, &ta);
+                    blst::blst_fp_sqr(&mut b, &tb);
+                    blst::blst_fp_sqr(&mut c, &tc);
+                    blst::blst_fp_sqr(&mut d, &td);
+                }
+            }
+            black_box((a, b, c, d));
+        });
+        println!("  {:<52} {:>9.2} x / {:.2} x", "two / four chains against one", two / one, four / one);
+        let x = seed(5);
+        time("blst_fp_sqrt (one Fp root)", 1_000, || {
+            let mut out = blst::blst_fp::default();
+            black_box(unsafe { blst::blst_fp_sqrt(&mut out, black_box(&x)) });
+            black_box(out);
+        });
+        time("blst_fp_inverse", 2_000, || {
+            let mut out = blst::blst_fp::default();
+            unsafe { blst::blst_fp_inverse(&mut out, black_box(&x)) };
+            black_box(out);
+        });
+    }
+
     println!("min-pk sign / verify");
     let sks: Vec<SecretKey> = (0..20u8).map(|i| SecretKey::key_gen(&[i + 1; 32], &[]).unwrap()).collect();
     let pks: Vec<PublicKey> = sks.iter().map(|s| s.sk_to_pk()).collect();
