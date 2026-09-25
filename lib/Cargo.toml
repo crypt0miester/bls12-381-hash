@@ -13,6 +13,9 @@ solana-program-error = "3.0.1"
 solana-sha256-hasher = "3.1.0"
 solana-define-syscall = "4.0.1"
 
+[target.'cfg(not(target_os = "solana"))'.dependencies]
+blst = { version = "0.3", optional = true }
+
 [features]
 default = ["ro"]
 ro = ["g1-ro", "g2-ro"]
@@ -25,3 +28,6 @@ modexp = []
 # inversion, 96 more bytes for about 14k less CU
 wide-witness = []
 full = ["g1-ro", "g2-ro", "g1-nu", "g2-nu", "modexp"]
+# host witness generation on blst's field arithmetic (asm): byte-identical
+# to the portable generators, about ten times faster
+blst = ["dep:blst"]

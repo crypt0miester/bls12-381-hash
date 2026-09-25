@@ -1467,3 +1467,32 @@ fn verify_rejects_empty_and_identity_points() {
         assert!(run(&mollusk, 63, &payload).program_result.is_err(), "tag 63: {label} accepted");
     }
 }
+
+// The blst-backed fat generator must match the portable one byte for byte:
+// the verifier accepts one blob per message, so any drift is a broken witness.
+#[test]
+fn fat_blst_generator_matches_portable() {
+    let mut flags_seen = [0usize; 4];
+    for i in 0..512u32 {
+        let msg = format!("blst witness check {i}: epoch {}, slot {}", i / 3, 9000 + i).into_bytes();
+        let portable = bls381_hash::witness::g2::generate_fat(&msg);
+        let fast = bls381_hash::witness::g2::generate_fat_blst(&msg);
+        assert_eq!(fast, portable, "blst generator differs on message {i}");
+        flags_seen[portable[0] as usize] += 1;
+    }
+    for msg in [&b""[..], MESSAGE, &[0xffu8; 300][..]] {
+        assert_eq!(
+            bls381_hash::witness::g2::generate_fat_blst(msg),
+            bls381_hash::witness::g2::generate_fat(msg)
+        );
+    }
+    assert!(flags_seen.iter().all(|&n| n > 0), "sweep missed a branch combination");
+
+    // and the program accepts it
+    let mollusk = mollusk();
+    let mut payload = bls381_hash::witness::g2::generate_fat_blst(MESSAGE);
+    payload.extend_from_slice(MESSAGE);
+    let r = run(&mollusk, 60, &payload);
+    assert!(!r.program_result.is_err());
+    assert_eq!(r.return_data, blst_hash_g2_serialized(MESSAGE).to_vec());
+}

@@ -64,6 +64,9 @@ fn host_speed() {
     time("generate_fat (837 B)", 200, || {
         black_box(bls381_hash::witness::g2::generate_fat(black_box(MESSAGE)));
     });
+    time("generate_fat_blst (837 B, blst field ops)", 2_000, || {
+        black_box(bls381_hash::witness::g2::generate_fat_blst(black_box(MESSAGE)));
+    });
     time("generate (530 B default)", 200, || {
         black_box(bls381_hash::witness::g2::generate(black_box(MESSAGE)));
     });

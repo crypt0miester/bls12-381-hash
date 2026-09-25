@@ -104,6 +104,7 @@ batches, 2026-09-25):
 |---|---|
 | hash_to_G2: blst / blstrs / solana-bls-signatures / zkcrypto | 92 / 93 / 95 / 251 |
 | this crate's witness generation: fat / default / parity | 347 / 368 / 292 |
+| fat witness on blst field ops (`blst` feature) | 43 |
 | field multiply: this crate's ps30 / blst asm | 0.048 / 0.020 |
 | blst Fp2 inverse / Fp2 square root | 1.7 / 15.0 |
 | blst Fp inverse / Fp square root | 1.6 / 7.3 |
@@ -123,6 +124,14 @@ about 75 multiplies, so its primitives sit at the M4's latency floor. What
 remains is the generator's own work: two roots per witness in place of ~15
 exponentiations, batched inverses, and the two maps' chains run in
 lockstep (two chains cost 1.5x one), for ~30-40 us.
+
+`witness::g2::generate_fat_blst` (the `blst` feature) builds that without
+the lockstep: one inverse for both tv2, blst's square test and one root per
+map, one inverse for both sigma, and the hash_to_field quotients by exact
+division (the low 192 bits of x - u times p^-1 mod 2^192). 43 us, 8.3x the
+portable generator and under blst's own hash_to_G2, byte-identical to
+generate_fat over 512 messages. The two roots are ~30 us of it, so running
+the maps on two threads or in lockstep is the only lever left.
 
 ## Compact witness layouts
 

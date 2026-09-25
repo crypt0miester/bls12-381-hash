@@ -107,7 +107,10 @@ pub(crate) fn fold(hi_block: &[u8; 32], lo_block: &[u8; 32]) -> (Fp, Fp) {
 }
 
 fn hash_to_field_g2(dst: &[u8], msg: &[u8]) -> [Elem2; 2] {
-    let blocks = expand_message_xmd_g2(dst, msg);
+    hash_to_field_from_blocks(&expand_message_xmd_g2(dst, msg))
+}
+
+fn hash_to_field_from_blocks(blocks: &[[u8; 32]; 8]) -> [Elem2; 2] {
     let mut elems = [
         Elem2 { canonical: Fp2 { c0: ZERO, c1: ZERO }, mont: Fp2 { c0: ZERO, c1: ZERO } },
         Elem2 { canonical: Fp2 { c0: ZERO, c1: ZERO }, mont: Fp2 { c0: ZERO, c1: ZERO } },
@@ -1737,6 +1740,15 @@ pub mod witness {
         out
     }
 
+    /// The fat blob through blst's field arithmetic, byte for byte the
+    /// output of generate_fat: one inverse for both tv2, a square test and
+    /// one root per map, one inverse for both sigma, and the field
+    /// quotients by exact division.
+    #[cfg(feature = "blst")]
+    pub fn generate_fat_blst(msg: &[u8]) -> Vec<u8> {
+        blst_backend::generate_fat(msg)
+    }
+
     /// The other root of one map: an equally valid witness that must
     /// reproduce the same point.
     pub fn flip_fat_root(blob: &[u8], map: usize) -> Vec<u8> {
@@ -1779,5 +1791,196 @@ pub mod witness {
     #[doc(hidden)]
     pub fn generate_compact_xgcd_steered(msg: &[u8], steer_flags: u8) -> Vec<u8> {
         generate_compact_prefix(msg, steer_flags).0
+    }
+
+    #[cfg(feature = "blst")]
+    mod blst_backend {
+        use super::*;
+        use crate::consts_g1::{INV, MODULUS};
+        use crate::consts_g2::{SSWU2_ELLP_A, SSWU2_XI};
+        use blst::{blst_fp, blst_fp2};
+
+        fn to_blst(a: &Fp) -> blst_fp {
+            let mut r = blst_fp::default();
+            unsafe { blst::blst_fp_from_uint64(&mut r, a.as_ptr()) };
+            r
+        }
+
+        fn to_blst2(a: &Fp2) -> blst_fp2 {
+            blst_fp2 { fp: [to_blst(&a.c0), to_blst(&a.c1)] }
+        }
+
+        /// Canonical limbs back out of blst's Montgomery form
+        fn from_blst2(a: &blst_fp2) -> Fp2 {
+            let mut c0 = [0u64; 6];
+            let mut c1 = [0u64; 6];
+            unsafe {
+                blst::blst_uint64_from_fp(c0.as_mut_ptr(), &a.fp[0]);
+                blst::blst_uint64_from_fp(c1.as_mut_ptr(), &a.fp[1]);
+            }
+            Fp2 { c0, c1 }
+        }
+
+        fn mul(a: &blst_fp2, b: &blst_fp2) -> blst_fp2 {
+            let mut r = blst_fp2::default();
+            unsafe { blst::blst_fp2_mul(&mut r, a, b) };
+            r
+        }
+
+        fn sqr(a: &blst_fp2) -> blst_fp2 {
+            let mut r = blst_fp2::default();
+            unsafe { blst::blst_fp2_sqr(&mut r, a) };
+            r
+        }
+
+        fn add(a: &blst_fp2, b: &blst_fp2) -> blst_fp2 {
+            let mut r = blst_fp2::default();
+            unsafe { blst::blst_fp2_add(&mut r, a, b) };
+            r
+        }
+
+        fn sub(a: &blst_fp2, b: &blst_fp2) -> blst_fp2 {
+            let mut r = blst_fp2::default();
+            unsafe { blst::blst_fp2_sub(&mut r, a, b) };
+            r
+        }
+
+        fn inverse(a: &blst_fp2) -> blst_fp2 {
+            assert!(a.fp.iter().any(|c| c.l.iter().any(|&l| l != 0)), "measure-zero input: zero to invert");
+            let mut r = blst_fp2::default();
+            unsafe { blst::blst_fp2_inverse(&mut r, a) };
+            r
+        }
+
+        /// x^3 + A' x + B'
+        fn gx(x: &blst_fp2, a: &blst_fp2, b: &blst_fp2) -> blst_fp2 {
+            add(&add(&mul(&sqr(x), x), &mul(a, x)), b)
+        }
+
+        /// a b mod 2^192 over u64 limbs
+        const fn mul192(a: [u64; 3], b: [u64; 3]) -> [u64; 3] {
+            let mut out = [0u64; 3];
+            let mut i = 0;
+            while i < 3 {
+                let mut carry = 0u128;
+                let mut j = 0;
+                while i + j < 3 {
+                    let t = (a[i] as u128) * (b[j] as u128) + (out[i + j] as u128) + carry;
+                    out[i + j] = t as u64;
+                    carry = t >> 64;
+                    j += 1;
+                }
+                i += 1;
+            }
+            out
+        }
+
+        /// p^-1 mod 2^192: two Newton steps from the 64-bit inverse behind INV
+        const PINV192: [u64; 3] = {
+            let p = [MODULUS[0], MODULUS[1], MODULUS[2]];
+            let mut x = [INV.wrapping_neg(), 0, 0];
+            let mut k = 0;
+            while k < 2 {
+                // x (2 - p x)
+                let px = mul192(p, x);
+                let (l0, b0) = 2u64.overflowing_sub(px[0]);
+                let (l1, b1) = 0u64.overflowing_sub(px[1]);
+                let (l1, b1b) = l1.overflowing_sub(b0 as u64);
+                let l2 = 0u64.wrapping_sub(px[2]).wrapping_sub((b1 | b1b) as u64);
+                x = mul192(x, [l0, l1, l2]);
+                k += 1;
+            }
+            x
+        };
+        const _: () = {
+            let one = mul192([MODULUS[0], MODULUS[1], MODULUS[2]], PINV192);
+            assert!(one[0] == 1 && one[1] == 0 && one[2] == 0);
+        };
+
+        /// floor((hi || lo) / p) given u = (hi || lo) mod p: the difference is
+        /// an exact multiple of p and the quotient is below 2^136, so the low
+        /// 192 bits (all in lo) times p^-1 recover it whole
+        fn exact_quotient(lo: &[u8; 32], u: &Fp) -> [u8; FIELD_Q] {
+            let x = [
+                u64::from_be_bytes(lo[24..32].try_into().unwrap()),
+                u64::from_be_bytes(lo[16..24].try_into().unwrap()),
+                u64::from_be_bytes(lo[8..16].try_into().unwrap()),
+            ];
+            let (d0, b0) = x[0].overflowing_sub(u[0]);
+            let (d1, b1) = x[1].overflowing_sub(u[1]);
+            let (d1, b1b) = d1.overflowing_sub(b0 as u64);
+            let d2 = x[2].wrapping_sub(u[2]).wrapping_sub((b1 | b1b) as u64);
+            let q = mul192([d0, d1, d2], PINV192);
+            assert!(q[2] < 256, "quotient past 136 bits");
+            let mut out = [0u8; FIELD_Q];
+            out[0] = q[2] as u8;
+            out[1..9].copy_from_slice(&q[1].to_be_bytes());
+            out[9..].copy_from_slice(&q[0].to_be_bytes());
+            out
+        }
+
+        pub(super) fn generate_fat(msg: &[u8]) -> Vec<u8> {
+            let blocks = expand_message_xmd_g2(crate::dst::G2_RO, msg);
+            let u = hash_to_field_from_blocks(&blocks);
+
+            let one = to_blst2(&Fp2 { c0: [1, 0, 0, 0, 0, 0], c1: ZERO });
+            let four = to_blst2(&Fp2 { c0: [4, 0, 0, 0, 0, 0], c1: ZERO });
+            let c = to_blst2(&from_mont2(&fp2(&SSWU2_C1_NEG_B_OVER_A)));
+            let xi = to_blst2(&from_mont2(&fp2(&SSWU2_XI)));
+            let a = to_blst2(&from_mont2(&fp2(&SSWU2_ELLP_A)));
+            let b = to_blst2(&from_mont2(&fp2(&SSWU2_ELLP_B)));
+            let xk = to_blst2(&from_mont2(&fp2(&ISO3V_XK)));
+
+            let uu = [to_blst2(&u[0].canonical), to_blst2(&u[1].canonical)];
+            let tv1 = [mul(&xi, &sqr(&uu[0])), mul(&xi, &sqr(&uu[1]))];
+            let tv2 = [add(&sqr(&tv1[0]), &tv1[0]), add(&sqr(&tv1[1]), &tv1[1])];
+            let w = inverse(&mul(&tv2[0], &tv2[1]));
+            let inv = [mul(&w, &tv2[1]), mul(&w, &tv2[0])];
+
+            let mut flags = 0u8;
+            let mut xs = [blst_fp2::default(); 2];
+            let mut ys = [Fp2 { c0: ZERO, c1: ZERO }; 2];
+            for i in 0..2 {
+                // x1 when gx1 is a square (zero counts, as in the RFC), else x2
+                let x1 = mul(&c, &add(&one, &inv[i]));
+                let gx1 = gx(&x1, &a, &b);
+                let (flag, x, g) = if unsafe { blst::blst_fp2_is_square(&gx1) } {
+                    (0u8, x1, gx1)
+                } else {
+                    let x2 = mul(&tv1[i], &x1);
+                    (1u8, x2, gx(&x2, &a, &b))
+                };
+                let mut y = blst_fp2::default();
+                assert!(unsafe { blst::blst_fp2_sqrt(&mut y, &g) }, "chosen branch has no root");
+                let y = from_blst2(&y);
+                ys[i] = if sgn0_fp2(&y) != sgn0_fp2(&u[i].canonical) { neg2(&y) } else { y };
+                xs[i] = x;
+                flags |= flag << i;
+            }
+
+            let t = [sub(&xs[0], &xk), sub(&xs[1], &xk)];
+            let w = inverse(&mul(&t[0], &t[1]));
+            let sigma = [mul(&four, &mul(&w, &t[1])), mul(&four, &mul(&w, &t[0]))];
+
+            let mut blob = Vec::with_capacity(FAT_TOTAL);
+            blob.push(flags);
+            for i in 0..2 {
+                push_fp2_mont(&mut blob, &to_mont2(&from_blst2(&xs[i])));
+                push_fp2_mont(&mut blob, &ys[i]);
+                push_fp2_mont(&mut blob, &to_mont2(&from_blst2(&sigma[i])));
+            }
+            for k in 0..4 {
+                let e = &u[k / 2];
+                let (mont, canonical) = if k % 2 == 0 {
+                    (e.mont.c0, e.canonical.c0)
+                } else {
+                    (e.mont.c1, e.canonical.c1)
+                };
+                blob.extend_from_slice(&limbs_to_be(&mont));
+                blob.extend_from_slice(&exact_quotient(&blocks[2 * k + 1], &canonical));
+            }
+            debug_assert_eq!(blob.len(), FAT_TOTAL);
+            blob
+        }
     }
 }

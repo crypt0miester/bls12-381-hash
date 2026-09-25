@@ -536,6 +536,7 @@ dependencies = [
 name = "bls381-hash"
 version = "0.1.0"
 dependencies = [
+ "blst",
  "solana-define-syscall 4.0.1",
  "solana-program-error",
  "solana-sha256-hasher",

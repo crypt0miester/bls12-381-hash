@@ -34,6 +34,7 @@ let point = hash_to_g2_compact_parity(dst::G2_RO, payload)?;
 // off-chain (host): build the witness for a message
 let witness = bls381_hash::witness::g1::generate(message);
 let witness = bls381_hash::witness::g2::generate_fat(message);
+let witness = bls381_hash::witness::g2::generate_fat_blst(message); // `blst` feature, 8x faster
 let witness = bls381_hash::witness::g2::generate_compact_parity(message);
 ```
 
@@ -46,6 +47,7 @@ let witness = bls381_hash::witness::g2::generate_compact_parity(message);
 | `g1-nu`, `g2-nu` | RFC 9380 encode_to_curve variants; not random-oracle suites, see the NU note in BENCHMARKS.md |
 | `modexp` | big_mod_exp-assisted zero-witness G1 and G2 paths, need SIMD-0529 |
 | `wide-witness` | 674 B G2 blob, ~7k CU cheaper; for 4 KiB (SIMD-0296) transactions |
+| `blst` | host only: `witness::g2::generate_fat_blst`, the fat witness on blst's field arithmetic (43 us against 347 us portable, same bytes) |
 | `full` | everything above |
 
 The `lib/` crate (`bls381-hash`) is the product; `program/` is an SBF
