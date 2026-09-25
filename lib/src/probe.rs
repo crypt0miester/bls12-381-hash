@@ -12,6 +12,7 @@ use crate::fp::{
 use crate::fp2::{add2, from_mont2, mul2, sq2, sub2, to_mont2, wit96, Fp2};
 use crate::g1::{expand_message_xmd, gx_at, iso11_adapted, mul_by_xi};
 use crate::g2::{expand_message_xmd_g2, gx2_at, iso3_adapted, mul_by_a2i, mul_by_xi2};
+use crate::fp::{fixed, quotient_matches};
 
 pub fn mont_mul_loop(count: u64) -> u64 {
     let mut a = R;
@@ -121,6 +122,24 @@ pub fn run(id: u8, count: u64) -> u64 {
             }
             acc
         }
+        26 => fp_loop(count, fixed::iso3v_a3),
+        27 => {
+            // quotient check on a fixed block pair, u changing every pass
+            let hi = [0x5au8; 32];
+            let lo = [0xa5u8; 32];
+            let q = [0u8; 17];
+            let mut acc = R;
+            for _ in 0..count {
+                if quotient_matches(&hi, &lo, &acc, &q) {
+                    acc[1] ^= 1;
+                }
+                acc[0] = acc[0].wrapping_add(1);
+            }
+            acc[0]
+        }
+        28 => fp2_loop(count, |x| crate::g2::probe_iso3_velu(x)),
+        29 => fp2_loop(count, |x| crate::g2::probe_pin(x, false)),
+        30 => fp2_loop(count, |x| crate::g2::probe_pin(x, true)),
         25 => {
             // divsteps inverse; alternates a and a^-1, loop-carried
             let mut a = R;

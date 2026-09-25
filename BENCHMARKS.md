@@ -16,14 +16,15 @@ byte-verified.
 | pipeline | CU | witness | compatibility |
 |---|---|---|---|
 | hash_to_G1 (RO, min-sig) | ~106k | 338 B | `_SSWU_RO_POP_`, byte-equal to blst |
-| hash_to_G2 (RO, min-pk) | ~203k | 530 B | `_SSWU_RO_POP_`, byte-equal to blst |
-| hash_to_G2 (RO, compact) | ~349k | 145 B | same suite, same output bytes |
-| hash_to_G2 (RO, xgcd) | ~387k | 97 B | same suite, same output bytes |
-| hash_to_G2 (RO, parity) | ~387k | 96 B | same suite, same output bytes |
-| hash_to_G2 (RO, `modexp`) | ~270k | 0 B | same suite, needs SIMD-0529 |
-| hash_to_G2 (RO, `wide-witness`) | ~196k | 674 B | same suite, bigger blob |
+| hash_to_G2 (RO, fat) | ~116k | 837 B | `_SSWU_RO_POP_`, byte-equal to blst |
+| hash_to_G2 (RO, min-pk) | ~190k | 530 B | same suite, same output bytes |
+| hash_to_G2 (RO, `wide-witness`) | ~183k | 674 B | same suite, bigger blob |
+| hash_to_G2 (RO, compact) | ~336k | 145 B | same suite, same output bytes |
+| hash_to_G2 (RO, xgcd) | ~375k | 97 B | same suite, same output bytes |
+| hash_to_G2 (RO, parity) | ~375k | 96 B | same suite, same output bytes |
+| hash_to_G2 (RO, `modexp`) | ~257k | 0 B | same suite, needs SIMD-0529 |
 | encode_to_G1 (NU) | ~82k | 193 B | `_SSWU_NU_POP_`, byte-equal to blst encode |
-| encode_to_G2 (NU) | ~140k | 385 B | `_SSWU_NU_POP_`, byte-equal to blst encode |
+| encode_to_G2 (NU) | ~129k | 385 B | `_SSWU_NU_POP_`, byte-equal to blst encode |
 
 The default and `wide-witness` G2 rows are the same pipeline with a
 different tv2 witness layout: the default 530 B blob pins both tv2
@@ -31,13 +32,16 @@ inverses behind one Fp witness on the product of their norms (norms are
 squarings, so the check runs cheaper than the Fp2 pair inversion it
 replaced, and 48 bytes smaller), while `wide-witness` ships both Fp2
 inverses directly (144 more bytes, ~7k CU less) for when SIMD-0296 4 KiB
-transactions land. The compact, xgcd and parity rows are the byte-bound
-layouts, detailed below. An end-to-end min-pk BLS verify (hash_to_G2 plus
-the pairing syscall) lands around 258k CU (251k wide, 404k compact, 443k
-xgcd or parity, 312k at k=20 for the zero-witness modexp path). A 381-bit
-field multiplication costs ~1.5k CU with the ps30 product-scanning
-multiplier under the register-pressure scheduler (the textbook 32-bit
-CIOS form bottoms out around 3.3k).
+transactions land. The fat row is the CU floor for v1 transactions and
+the compact, xgcd and parity rows are the byte-bound layouts, both
+detailed below. An end-to-end min-pk BLS verify (hash_to_G2 plus the
+pairing syscall) at k=14 lands around 169k CU with the fat blob (154k
+with the signature and absentee keys uncompressed), 245k default, 239k
+wide, 391k compact, 430k xgcd or parity, and 299k at k=20 for the
+zero-witness modexp path. A 381-bit field multiplication costs ~1.5k CU
+with the ps30 product-scanning multiplier under the register-pressure
+scheduler (the textbook 32-bit CIOS form bottoms out around 3.3k), and a
+multiplication by a fixed constant ~0.76k through lane tables.
 
 The NU suites hash with a single map (RFC 9380 encode_to_curve). Note that
 the CFRG BLS signature draft registers only hash_to_curve (RO) ciphersuites,
@@ -49,25 +53,65 @@ suffices for unforgeability. That makes it a deliberate protocol choice, and
 the hash must never be reused for anything that actually needs a random
 oracle.
 
+## Fat layout
+
+Tags 60 (hash), 61 (min-pk verify through `hash_to_g2_fat_for_pairing`),
+62 (stage prefixes) and 63 (verify with uncompressed signature and
+absentee keys), at bench commit of 2026-09-25:
+
+| stage | CU |
+|---|---|
+| hash_to_field (witnessed reductions) | 7,359 |
+| x pins, both maps | 23,478 |
+| roots, iso-3 per map, E add | 47,535 |
+| clear_cofactor + validate | 37,735 |
+| total (16 messages min / avg / max) | 113,828 / 115,619 / 118,538 |
+| verify k=14 / k=20 | 169,404 / 155,793 |
+| verify k=14 / k=20, uncompressed inputs | 153,706 / 152,737 |
+
+The blob is 837 bytes: a flags byte, per map x, y and sigma (96 bytes
+each), and per field element its Montgomery form and 17-byte quotient.
+Every witness is a value the pipeline uses directly. x is pinned by one
+product against a constant, (x - C) tv2 == C on the x1 branch for
+C = -B'/A', and (60x - 253(i - 1) tv1)(tv1 + 1) == 253(i - 1) on the x2
+branch, which needs no tv1^2. The iso-3 kernel point is x_k = -6 + 6i, so
+both denominators are powers of t = x - x_k, and in Velu form with
+sigma = 4 / t every numerator coefficient is an integer below 16:
+X = a3 (x + 12i sigma + (1 + i) sigma^2) and
+Y = (c a3 / 2) y (2 - 6i sigma^2 - (1 + i) sigma^3) (`tools/velu_iso3.py`
+derives and checks these). Each map lands on E alone, and the g2 add
+syscall that joins the two images checks both on the curve. Since
+Y^2 - X^3 - B = F^2 (y^2 - g'(x)) for F the y factor, an image on E proves
+its root and the root proves its branch, so no curve check runs on E' at
+all. y ships canonical, which makes its sign free and lands Y canonical
+with no redc. hash_to_field checks from_mont(w) + q p == x over the
+integers (65 lane products) in place of the fold's two multiplies. Per
+map the verifier spends 2 sq2 + 4 mul2 + 4 fixed multiplies (one sq2
+fewer on the x2 branch). The soundness sweep flips every blob bit, the
+steered generator ships the other branch's x with a consistent sigma and
+must abort, either root of either map reproduces the point, and 256
+messages covering all four branch combinations match blst byte for byte.
+
 ## Compact witness layouts
 
 Three G2 layouts restructure the same checks to shrink the blob for
 byte-bound transactions (hash tags 48/49/50, end-to-end verify tags
-54/55/56, exact numbers at bench commit of 2026-07-23):
+54/55/56, exact numbers at bench commit of 2026-09-25):
 
 | layout | blob | hash CU | e2e verify k=14 / k=20 |
 |---|---|---|---|
-| default | 530 B | 202,666 | 257,972 / 244,319 |
-| compact | 145 B | 348,512 | 403,786 / 390,175 |
-| xgcd | 97 B | 387,354 | 442,628 / 429,017 |
-| parity | 96 B | 387,302 | 442,575 / 428,964 |
-| modexp | 0 B | 270,123 | (tag 58) - / 311,787 |
+| fat | 837 B | 116,108 | 169,404 / 155,793 |
+| default | 530 B | 189,863 | 245,168 / 231,515 |
+| compact | 145 B | 335,709 | 390,984 / 377,373 |
+| xgcd | 97 B | 374,551 | 429,824 / 416,213 |
+| parity | 96 B | 374,501 | 429,774 / 416,163 |
+| modexp | 0 B | 257,321 | (tag 58) - / 298,982 |
 
 The witness-free-inverse rows move a little with the message (the divsteps
 batch count is input-dependent): over eight messages the parity hash spans
-382.7k to 393.9k, average 390.0k. The 2024 hull bound caps any input at
+369.9k to 381.1k, average 377.2k. The 2024 hull bound caps any input at
 1078 divsteps (36 batches before the g == 0 exit), putting the worst case
-near ~396k.
+near ~383k.
 
 The compact blob is one flags byte (the two SSWU branch bits), the real
 halves of the two square roots, and one batched inverse witness. A root
@@ -133,10 +177,10 @@ Tags 46/47, cumulative prefixes of the witnessed pipelines:
 
 | stage | min-sig G1 | min-pk G2 |
 |---|---|---|
-| hash_to_field | 8.0k | 16.4k |
+| hash_to_field | 8.0k | 15.3k |
 | both SSWU maps | 27.7k | 77.4k |
 | E' add + isogeny | 55.7k | 59.5k |
-| clear_cofactor + validate | 14.9k | 49.4k |
+| clear_cofactor + validate | 14.9k | 37.7k |
 
 The maps and the isogeny evaluation split the field work (soundness
 requires evaluating all four polynomials at the summed point, so no
@@ -333,13 +377,54 @@ pricing.
   the 4 KiB SBF stack frame (5,760 B estimated by the linker) and the
   conditional-branch relaxation range.
 
+- The fat layout (2026-09-25, tags 60 to 63): 837 bytes for v1
+  transactions, detailed above. Against the default 530 B path it drops
+  the tv2 inverse and its unpacking (x pinned directly), the curve checks
+  on E' (the add syscall checks both images on E), the E' slope witness
+  and the Horner iso (two Velu-form isos with tiny coefficients instead),
+  and both from_mont2 output conversions (canonical y and canonical
+  constants land X and Y canonical). 202,666 to 139,439 before the shared
+  moves below, 116,108 after.
+- Witnessed hash_to_field (2026-09-25, fat layout): per field element a
+  Montgomery form and a quotient, checked by from_mont and a straight-line
+  65-product integer compare (`tools/gen_quotient.py`, 476 CU) in place of
+  the fold's multiply plus to_mont: 15.8k to 8.6k (7.4k with the SHA move
+  below). A loop version of the same check measured 1.4k per element
+  (LLVM left the lane split and columns as runtime loops with table loads).
+- Fixed-multiplier lane tables (2026-09-25): for a constant K,
+  T[i] = K 2^(30 i - 330) mod p makes sum_i a_i T[i] plus two Montgomery
+  quotient lanes equal mont_mul(a, K), 195 products with every T lane an
+  immediate, 756 CU against 1,508 (`fp.rs::fixed`, `tools/gen_fixed.py`,
+  host-checked against mont_mul). Used for psi, psi^2 and the Velu scale
+  factors: -4.3k on every G2 path's clearing, -8.4k more on the fat path.
+- Ping-pong syscall buffers (2026-09-25): mul_by_chain returned each
+  192-byte result by value, two sol_memcpy calls per step. The chains now
+  hand the syscall its destination and swap buffers: clearing 49.4k to
+  42.9k on every G2 path, then 37.7k with the doublings run between the
+  set bits (the chain scalars are constants, so the bit tests fold).
+- expand_message_xmd (2026-09-25): the syscall charges max(10, len / 2)
+  per slice, so each block hashes its fixed tail as one slice, and the
+  chaining XOR runs on words: 2,677 to 1,547.
+- Small-integer accumulators (2026-09-25): seven-limb sums with small
+  factors and one div64-estimated reduction replace the m12/m6 add chains
+  and the C tv1 multiply in the fat path (-1.2k).
+- A pairing-bound entry (2026-09-25): `hash_to_g2_fat_for_pairing` skips
+  the final validate, which the pairing syscall repeats (-2.2k on the
+  verify). A v1 verify can also ship the signature and absentee keys
+  uncompressed (+96 and +48 bytes each) and skip every decompress: tag 63
+  measures 153,706 at k=14 against 169,404.
+
 ## Measured dead ends
 
 - 64-bit limb CIOS via u128: SBPF v3 dropped the v2-only PQR instruction
   class (UHMUL/SHMUL), so `(a as u128) * (b as u128)` lowers to a `__multi3`
   call at ~70 CU per multiply-accumulate (probe tag 21).
 - Lazy Fp2 reduction (Karatsuba with unreduced 27-lane products and two wide
-  reductions instead of three full multiplies): mul2 got ~9% slower. The
+  reductions instead of three full multiplies): mul2 got ~9% slower.
+  Re-measured under list-hybrid (2026-09-25) with generated 26-lane
+  kernels: the loop probe wins 3% (4,733 against 4,879), but swapped into
+  the pipeline the fat hash rises 116,107 to 119,494 and the default path
+  189,862 to 194,696, so the fused mul2 stays. The
   fused multiply keeps operand splits shared and the accumulator hot;
   splitting product from reduction pays more in array traffic than the saved
   reduction pass (details at `fp2.rs::mul2`).
@@ -437,18 +522,22 @@ pricing.
 Open knobs, in rough order of interest:
 
 - The modexp paths run zero-witness: hash_to_G1 (tags 30 to 33) in ~135k
-  CU against ~106k plus 338 B witnessed, hash_to_G2 (tags 57/58) in ~270k
-  against ~387k plus 96 B for the parity blob. Both need `big_mod_exp`
-  (SIMD-0529, merged but not active on mainnet; the bench harness runs
-  it). Once 0529 activates the G2 witness family is dominated outright
-  and only the 530 B default and 674 B wide blobs keep a role as the CU
-  floor.
-- The min-pk verify transaction is byte-bound, not CU-bound (258k to 443k
-  of the 1.4M CU ceiling, but witness plus keys eat real transaction
-  space). The byte/CU frontier is now the layout choice: 530 B at ~203k,
-  145 B at ~349k, 96 B at ~387k, with `wide-witness` (674 B, ~196k) as the
-  CU end once SIMD-0296 (4 KiB transactions, SDK support already merged)
-  dissolves the byte constraint, and 0 B at ~270k once SIMD-0529 does.
+  CU against ~106k plus 338 B witnessed, hash_to_G2 (tags 57/58) in ~257k
+  against ~375k plus 96 B for the parity blob. Both need `big_mod_exp`
+  (SIMD-0529, merged but not active on mainnet, and the bench harness runs
+  it). Once 0529 activates it replaces the byte-bound blobs, while the fat
+  blob (~116k) stays the CU floor.
+- v1 transactions (4 KiB) are live, so the verify is no longer byte-bound:
+  the fat layout (837 B, ~116k) is the CU floor and beats the zero-witness
+  modexp path (~257k) as well. The byte-bound frontier stays 530 B at
+  ~190k, 145 B at ~336k, 96 B at ~375k for legacy transactions.
+- Open fat-path knobs, measured or modeled: a single integer check
+  w + q' p == x 2^390 (q' 66 bytes) would drop the four from_mont calls
+  for ~0.9k net and +196 bytes. Lane-resident operands (skipping split30
+  and pack30 between chained multiplies) model at ~3-5k but touch every
+  ps30 bound. The remaining fat budget is 8 mul2 + 5 sq2 (~55k), 141 g2
+  syscalls (~29k), 12 fixed multiplies (~9k) and ~13k of adds, parsing
+  and glue.
 - `inv_divsteps` sits at ~34.4k after the scheduler change and the
   re-inlined update passes; dynamic f/g length tracking is still worth
   maybe ~2k. The batch geometry itself is optimal: total update work
@@ -463,9 +552,10 @@ Open knobs, in rough order of interest:
   transplantable ideas are all resolved: the half-delta variant and the
   60-step composed updates were measured and rejected, the packed inner
   loop rejected on arithmetic (all three in the dead ends).
-- G2 cofactor clearing costs ~49k CU: 141 g2 add syscalls (two 63-double
-  chains, addition-chain optimal, plus the fused tail) with ~8k of
-  psi/psi2 field work and the 2.2k validate on top. The Budroni-Pintore
+- G2 cofactor clearing costs ~37.7k CU: 141 g2 add syscalls (two
+  63-double chains, addition-chain optimal, plus the fused tail, ~28.7k of
+  syscall price) with ~4.5k of psi/psi2 fixed multiplies and the 2.2k
+  validate on top. The Budroni-Pintore
   chain is the best known construction, so the syscall share is pricing
   rather than structure. The verify path feeds the hash into the pairing
   uncompressed, so no decompression cost hides there.
@@ -474,12 +564,13 @@ Open knobs, in rough order of interest:
   left is genuine ten-register pressure (mul64 destroying its destination
   charges a placement per product either way); fewer lanes would need a
   wider multiply, which the ISA does not have.
-- The final validate syscall is defense-in-depth, not load-bearing: the
-  cleared bytes come out of the last group-op syscall (on the curve by
-  construction) and Budroni-Pintore style clearing lands any curve point in
-  the subgroup. The pairing syscall subgroup-checks its own inputs (pinned
-  by the syscall-contract test), so a pairing-bound consumer could drop the
-  validate for another ~2.2k (G2) / ~1.8k (G1) CU; the standalone hash
-  keeps it as the one runtime assertion on its own output. The stage
+- The final validate syscall is defense-in-depth: the cleared bytes come
+  out of the last group-op syscall (on the curve by construction) and
+  Budroni-Pintore style clearing lands any curve point in the subgroup.
+  The pairing syscall subgroup-checks its own inputs (pinned by the
+  syscall-contract test), so `hash_to_g2_fat_for_pairing` drops it for
+  ~2.2k, and the other pairing-bound paths could do the same (~2.2k G2,
+  ~1.8k G1). The standalone hash keeps it as the one runtime assertion on
+  its own output. The stage
   parameter threaded through the prefix entry points costs ~3 CU end to
   end, measured tag against tag.

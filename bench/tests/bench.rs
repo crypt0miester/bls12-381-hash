@@ -291,6 +291,11 @@ fn bench_function_costs() {
         (23, "expand_message_xmd g1", 100),
         (24, "expand_message_xmd g2", 100),
         (25, "inv_divsteps", 200),
+        (26, "fixed mul (a3)", 20_000),
+        (27, "quotient check", 20_000),
+        (28, "iso3_velu body", 1_000),
+        (29, "pin (branch 1)", 2_000),
+        (30, "pin (branch 2)", 2_000),
     ];
     println!("per function CU:");
     for &(id, name, n) in probes {
@@ -993,6 +998,7 @@ fn field_arithmetic_selftest() {
     bls381_hash::witness::g1::iso11_adapted_selftest();
     bls381_hash::witness::g1::redc_selftest();
     bls381_hash::witness::g1::inv_divsteps_selftest();
+    bls381_hash::witness::g1::fixed_selftest();
 }
 
 #[test]
@@ -1123,4 +1129,244 @@ fn bench_min_pk_verify_compact_end_to_end() {
             assert!(rejected.program_result.is_err(), "forged {label} min-pk verify accepted at k={k}");
         }
     }
+}
+
+fn fat_payload(msg: &[u8]) -> Vec<u8> {
+    let mut payload = bls381_hash::witness::g2::generate_fat(msg);
+    payload.extend_from_slice(msg);
+    payload
+}
+
+#[test]
+fn bench_witness_hash_to_g2_fat() {
+    let mollusk = mollusk();
+
+    let payload = fat_payload(MESSAGE);
+    let result = run(&mollusk, 60, &payload);
+    assert!(
+        !result.program_result.is_err(),
+        "fat hash_to_g2 failed: {:?}",
+        result.program_result
+    );
+    assert_eq!(result.return_data, blst_hash_g2_serialized(MESSAGE).to_vec(), "differs from blst");
+    println!(
+        "fat witness-assisted hash_to_G2: {} CU ({} witness bytes)",
+        result.compute_units_consumed,
+        payload.len() - MESSAGE.len()
+    );
+
+    let mut bad = payload.clone();
+    bad[200] ^= 1;
+    assert!(run(&mollusk, 60, &bad).program_result.is_err(), "corrupt fat witness was accepted");
+}
+
+#[test]
+fn bench_fat_stage_breakdown() {
+    let mollusk = mollusk();
+    let names = ["hash_to_field", "x pins", "roots + iso + add", "clear + validate"];
+    let witness = bls381_hash::witness::g2::generate_fat(MESSAGE);
+    let mut cumulative = [0u64; 4];
+    for stage in 0..4u8 {
+        let mut payload = vec![stage];
+        payload.extend_from_slice(&witness);
+        payload.extend_from_slice(MESSAGE);
+        let r = run(&mollusk, 62, &payload);
+        assert!(!r.program_result.is_err(), "fat stage {stage} failed");
+        cumulative[stage as usize] = r.compute_units_consumed;
+    }
+    println!("fat min-pk G2 stages (flags {:#04b}):", witness[0]);
+    for (i, name) in names.iter().enumerate() {
+        let delta = if i == 0 { cumulative[0] } else { cumulative[i] - cumulative[i - 1] };
+        println!("  {name:<18} {delta:>7} CU (cumulative {})", cumulative[i]);
+    }
+}
+
+// Default and fat layouts side by side over the same messages: branch
+// flags vary, so both the mean and the spread matter.
+#[test]
+fn bench_fat_message_spread() {
+    let mollusk = mollusk();
+    let messages: Vec<Vec<u8>> = (0..16u8)
+        .map(|i| format!("tapedrive vote payload: epoch {i}, slot {}", 1337 + i as u32).into_bytes())
+        .collect();
+    for (tag, label) in [(41u8, "default"), (60, "fat")] {
+        let (mut lo, mut hi, mut sum) = (u64::MAX, 0u64, 0u64);
+        for msg in &messages {
+            let mut payload = if tag == 60 {
+                bls381_hash::witness::g2::generate_fat(msg)
+            } else {
+                bls381_hash::witness::g2::generate(msg)
+            };
+            payload.extend_from_slice(msg);
+            let r = run(&mollusk, tag, &payload);
+            assert!(!r.program_result.is_err(), "{label} hash failed");
+            assert_eq!(r.return_data, blst_hash_g2_serialized(msg).to_vec(), "{label} differs from blst");
+            let cu = r.compute_units_consumed;
+            lo = lo.min(cu);
+            hi = hi.max(cu);
+            sum += cu;
+        }
+        println!(
+            "{label} hash CU over {} messages: min {lo} / avg {} / max {hi}",
+            messages.len(),
+            sum / messages.len() as u64
+        );
+    }
+}
+
+// No witness bit can steer the fat output. The flags byte is canonical,
+// witnesses are message-bound, either root of either map gives the same
+// point, and a branch lie (the other SSWU candidate, pinned consistently
+// with the lied flag) cannot land on E.
+#[test]
+fn witness_g2_fat_soundness() {
+    let mollusk = mollusk();
+
+    let witness = bls381_hash::witness::g2::generate_fat(MESSAGE);
+    let mut payload = witness.clone();
+    payload.extend_from_slice(MESSAGE);
+
+    let good = run(&mollusk, 60, &payload);
+    assert!(!good.program_result.is_err(), "honest witness rejected");
+    let truth = good.return_data.clone();
+
+    for i in 0..witness.len() {
+        let mut bad = payload.clone();
+        bad[i] ^= 1;
+        let r = run(&mollusk, 60, &bad);
+        if !r.program_result.is_err() {
+            assert_eq!(r.return_data, truth, "witness byte {i} steered the output");
+        }
+    }
+    for bit in 2..8 {
+        let mut bad = payload.clone();
+        bad[0] ^= 1 << bit;
+        assert!(run(&mollusk, 60, &bad).program_result.is_err(), "flag bit {bit} accepted");
+    }
+
+    for start in (1..witness.len()).step_by(48) {
+        let mut oob = payload.clone();
+        for byte in oob[start..start + 48].iter_mut() {
+            *byte = 0xff;
+        }
+        assert!(
+            run(&mollusk, 60, &oob).program_result.is_err(),
+            "out-of-range witness accepted at byte {start}"
+        );
+    }
+
+    let mut replay = witness.clone();
+    replay.extend_from_slice(b"a different snapshot vote payload");
+    assert!(run(&mollusk, 60, &replay).program_result.is_err(), "cross-message replay accepted");
+
+    for map in 0..2 {
+        let mut alt = bls381_hash::witness::g2::flip_fat_root(&witness, map);
+        alt.extend_from_slice(MESSAGE);
+        let same = run(&mollusk, 60, &alt);
+        assert!(!same.program_result.is_err(), "flipped root {map} rejected");
+        assert_eq!(same.return_data, truth, "flipped root {map} changed the point");
+    }
+
+    for steer in [1u8, 2, 3] {
+        let mut lied = bls381_hash::witness::g2::generate_fat_steered(MESSAGE, steer);
+        lied.extend_from_slice(MESSAGE);
+        assert!(
+            run(&mollusk, 60, &lied).program_result.is_err(),
+            "steered branch flags {steer:#04b} accepted"
+        );
+    }
+}
+
+#[test]
+fn bench_min_pk_verify_fat_end_to_end() {
+    use blst::min_pk::{AggregatePublicKey, AggregateSignature, PublicKey, SecretKey, Signature};
+
+    let mollusk = mollusk();
+    let keys: Vec<SecretKey> = (0..20u8)
+        .map(|i| SecretKey::key_gen(&[i + 1; 32], &[]).unwrap())
+        .collect();
+    let pks: Vec<PublicKey> = keys.iter().map(|s| s.sk_to_pk()).collect();
+    let all_refs: Vec<&PublicKey> = pks.iter().collect();
+    let agg_all = AggregatePublicKey::aggregate(&all_refs, false).unwrap().to_public_key();
+    let witness = bls381_hash::witness::g2::generate_fat(MESSAGE);
+
+    for k in [14usize, 20] {
+        let sigs: Vec<Signature> = keys[..k].iter().map(|s| s.sign(MESSAGE, DST_G2, &[])).collect();
+        let sig_refs: Vec<&Signature> = sigs.iter().collect();
+        let agg_sig = AggregateSignature::aggregate(&sig_refs, false).unwrap().to_signature();
+
+        let mut payload = vec![(20 - k) as u8];
+        payload.extend_from_slice(&agg_all.serialize());
+        payload.extend_from_slice(&agg_sig.compress());
+        for pk in &pks[k..] {
+            payload.extend_from_slice(&pk.compress());
+        }
+        payload.extend_from_slice(&witness);
+        payload.extend_from_slice(MESSAGE);
+
+        let result = run(&mollusk, 61, &payload);
+        assert!(!result.program_result.is_err(), "fat min-pk verify failed at k={k}: {:?}", result.program_result);
+        println!("fat min-pk end-to-end verify k={k}: {} CU", result.compute_units_consumed);
+
+        let mut bad = payload.clone();
+        bad[1 + 96 + 10] ^= 1;
+        assert!(run(&mollusk, 61, &bad).program_result.is_err(), "forged fat min-pk verify accepted at k={k}");
+    }
+}
+
+// The same verify with the signature and absentee keys uncompressed (tag
+// 63): the v1 byte budget buys back every decompress syscall.
+#[test]
+fn bench_min_pk_verify_fat_uncompressed() {
+    use blst::min_pk::{AggregatePublicKey, AggregateSignature, PublicKey, SecretKey, Signature};
+
+    let mollusk = mollusk();
+    let keys: Vec<SecretKey> = (0..20u8)
+        .map(|i| SecretKey::key_gen(&[i + 1; 32], &[]).unwrap())
+        .collect();
+    let pks: Vec<PublicKey> = keys.iter().map(|s| s.sk_to_pk()).collect();
+    let all_refs: Vec<&PublicKey> = pks.iter().collect();
+    let agg_all = AggregatePublicKey::aggregate(&all_refs, false).unwrap().to_public_key();
+    let witness = bls381_hash::witness::g2::generate_fat(MESSAGE);
+
+    for k in [14usize, 20] {
+        let sigs: Vec<Signature> = keys[..k].iter().map(|s| s.sign(MESSAGE, DST_G2, &[])).collect();
+        let sig_refs: Vec<&Signature> = sigs.iter().collect();
+        let agg_sig = AggregateSignature::aggregate(&sig_refs, false).unwrap().to_signature();
+
+        let mut payload = vec![(20 - k) as u8];
+        payload.extend_from_slice(&agg_all.serialize());
+        payload.extend_from_slice(&agg_sig.serialize());
+        for pk in &pks[k..] {
+            payload.extend_from_slice(&pk.serialize());
+        }
+        payload.extend_from_slice(&witness);
+        payload.extend_from_slice(MESSAGE);
+
+        let result = run(&mollusk, 63, &payload);
+        assert!(!result.program_result.is_err(), "uncompressed fat verify failed at k={k}: {:?}", result.program_result);
+        println!("fat min-pk verify, uncompressed inputs, k={k}: {} CU", result.compute_units_consumed);
+
+        let mut bad = payload.clone();
+        bad[1 + 96 + 100] ^= 1;
+        assert!(run(&mollusk, 63, &bad).program_result.is_err(), "tampered uncompressed verify accepted at k={k}");
+    }
+}
+
+// Byte equality with blst across many messages (both branch bits, all
+// sign combinations), the fat layout's broad correctness guard.
+#[test]
+fn fat_matches_blst_across_messages() {
+    let mollusk = mollusk();
+    let mut flags_seen = [0usize; 4];
+    for i in 0..256u32 {
+        let msg = format!("fat sweep message {i}: epoch {}, slot {}", i / 7, 1000 + i).into_bytes();
+        let payload = fat_payload(&msg);
+        flags_seen[payload[0] as usize] += 1;
+        let r = run(&mollusk, 60, &payload);
+        assert!(!r.program_result.is_err(), "fat hash failed on message {i}");
+        assert_eq!(r.return_data, blst_hash_g2_serialized(&msg).to_vec(), "fat differs from blst on message {i}");
+    }
+    println!("fat sweep: 256 messages blst-equal, branch flags seen {flags_seen:?}");
+    assert!(flags_seen.iter().all(|&n| n > 0), "sweep missed a branch combination");
 }

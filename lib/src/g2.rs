@@ -12,18 +12,17 @@ use solana_program_error::ProgramError;
 use alloc::vec::Vec;
 
 use crate::fp2::*;
-use crate::fp::{split_witness,
+use crate::fp::{fixed, split_witness, wide_add, wide_mac, wide_reduce,
     add_mod, add_unreduced, be_to_limbs, from_mont, inv_divsteps, is_zero, limbs_to_be,
-    modexp_bytes, mont_mul, mont_sqr, neg_mod, sub_mod, sys, to_mont, wit48, Fp,
+    modexp_bytes, mont_mul, mont_sqr, neg_mod, quotient_matches, sub_mod, sys, to_mont, wit48, Fp,
 };
 use crate::consts_g1::{MODULUS, R3};
 #[cfg(not(feature = "wide-witness"))]
 use crate::consts_g1::R;
 use crate::g1::check_inverse;
 use crate::consts_g2::{
-    C256_MONT, ISO3A_XDEN, ISO3A_XNUM, ISO3A_YDEN, ISO3A_YNUM,
-    PSI2_X_C0, PSI_X_C1, PSI_Y,
-    SSWU2_C1_NEG_B_OVER_A, SSWU2_ELLP_B,
+    C256_MONT, FOUR, ISO3A_XDEN, ISO3A_XNUM, ISO3A_YDEN, ISO3A_YNUM,
+    ISO3V_XK, PSI_Y, SSWU2_C1_NEG_B_OVER_A, SSWU2_C60, SSWU2_ELLP_B, TWO,
 };
 
 const BLS_X_ABS: u64 = 0xd201000000010000;
@@ -52,23 +51,40 @@ const W_TOTAL: usize = 2 * (1 + 96) + W_TV2 + 3 * 96;
 const _: () = assert!(W_TOTAL == 530 || W_TOTAL == 674);
 const _: () = assert!(194 + W_TV2 + 3 * 96 == W_TOTAL);
 
+/// The syscall charges max(10, len / 2) per slice on top of its base, so
+/// each hash passes its fixed tail as one slice, and the chaining XOR runs
+/// on words. Out of line: the two tail buffers stay out of the callers'
+/// frames.
+#[inline(never)]
 pub(crate) fn expand_message_xmd_g2(dst: &[u8], msg: &[u8]) -> [[u8; 32]; 8] {
     use solana_sha256_hasher::hashv;
 
-    let z_pad = [0u8; 64];
-    let l_i_b = [1u8, 0];
-    let dst_len = [dst.len() as u8];
+    let n = dst.len();
+    // b0 = H(Z_pad || msg || l_i_b || 0 || dst || len)
+    let mut tail = [0u8; 4 + 255];
+    tail[0] = 1;
+    tail[3..3 + n].copy_from_slice(dst);
+    tail[3 + n] = n as u8;
+    let b0 = hashv(&[&[0u8; 64], msg, &tail[..4 + n]]).to_bytes();
 
-    let b0 = hashv(&[&z_pad, msg, &l_i_b, &[0u8], dst, &dst_len]).to_bytes();
-
+    // b_i = H((b0 ^ b_(i-1)) || i || dst || len)
+    let mut buf = [0u8; 34 + 255];
+    buf[..32].copy_from_slice(&b0);
+    buf[32] = 1;
+    buf[33..33 + n].copy_from_slice(dst);
+    buf[33 + n] = n as u8;
+    let len = 34 + n;
     let mut blocks = [[0u8; 32]; 8];
-    blocks[0] = hashv(&[&b0, &[1u8], dst, &dst_len]).to_bytes();
+    blocks[0] = hashv(&[&buf[..len]]).to_bytes();
     for i in 1..8 {
-        let mut x = [0u8; 32];
-        for j in 0..32 {
-            x[j] = b0[j] ^ blocks[i - 1][j];
+        for w in 0..4 {
+            let r = 8 * w..8 * w + 8;
+            let x = u64::from_le_bytes(b0[r.clone()].try_into().unwrap())
+                ^ u64::from_le_bytes(blocks[i - 1][r.clone()].try_into().unwrap());
+            buf[r].copy_from_slice(&x.to_le_bytes());
         }
-        blocks[i] = hashv(&[&x, &[i as u8 + 1], dst, &dst_len]).to_bytes();
+        buf[32] = i as u8 + 1;
+        blocks[i] = hashv(&[&buf[..len]]).to_bytes();
     }
     blocks
 }
@@ -408,11 +424,16 @@ fn iso_map_witnessed(p: &Point2, w_x: &Fp2, w_y: &Fp2) -> Result<[u8; POINT], Pr
 /// Zcash uncompressed layout: x.c1 || x.c0 || y.c1 || y.c0, big-endian.
 pub(crate) fn point_bytes(x: &Fp2, y: &Fp2) -> [u8; POINT] {
     let mut out = [0u8; POINT];
+    write_point(&mut out, x, y);
+    out
+}
+
+#[inline(always)]
+pub(crate) fn write_point(out: &mut [u8; POINT], x: &Fp2, y: &Fp2) {
     out[..48].copy_from_slice(&limbs_to_be(&x.c1));
     out[48..96].copy_from_slice(&limbs_to_be(&x.c0));
     out[96..144].copy_from_slice(&limbs_to_be(&y.c1));
     out[144..].copy_from_slice(&limbs_to_be(&y.c0));
-    out
 }
 
 fn parse_point(bytes: &[u8; POINT]) -> (Fp2, Fp2) {
@@ -466,19 +487,64 @@ pub(crate) fn g2_validate(p: &[u8; POINT]) -> Result<(), ProgramError> {
     Ok(())
 }
 
+/// One group op written straight into the caller's buffer
+#[inline(always)]
+fn g2_op_to(op: u64, a: &[u8; POINT], b: &[u8; POINT], out: &mut [u8; POINT]) -> Result<(), ProgramError> {
+    let rc = unsafe {
+        sys::sol_curve_group_op(BLS12_381_G2_BE, op, a.as_ptr(), b.as_ptr(), out.as_mut_ptr())
+    };
+    if rc != 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok(())
+}
+
+/// n doublings, the accumulator trading buffers each step, pairs without
+/// a swap
+#[inline(always)]
+fn double_run<'a>(
+    mut cur: &'a mut [u8; POINT],
+    mut next: &'a mut [u8; POINT],
+    n: u32,
+) -> Result<(&'a mut [u8; POINT], &'a mut [u8; POINT]), ProgramError> {
+    for _ in 0..n / 2 {
+        g2_op_to(OP_ADD, cur, cur, next)?;
+        g2_op_to(OP_ADD, next, next, cur)?;
+    }
+    if n & 1 == 1 {
+        g2_op_to(OP_ADD, cur, cur, next)?;
+        core::mem::swap(&mut cur, &mut next);
+    }
+    Ok((cur, next))
+}
+
 /// [k]Q by double-and-add over the add syscall; both chain scalars are
 /// 64-bit and sparse. BLS x is negative, and the caller folds the sign
-/// into its combination instead of negating any chain output.
+/// into its combination instead of negating any chain output. The
+/// accumulator ping-pongs between two buffers, so each syscall writes its
+/// result in place of a 192-byte copy per step, and the doublings run
+/// between the set bits with no per-bit test (k is a constant at every
+/// call, so the runs fold).
 #[inline(always)]
-fn mul_by_chain(q: &[u8; POINT], k: u64) -> Result<[u8; POINT], ProgramError> {
-    let mut acc = *q;
-    for bit in (0..63).rev() {
-        acc = g2_add(&acc, &acc)?;
-        if (k >> bit) & 1 == 1 {
-            acc = g2_add(&acc, q)?;
-        }
+fn mul_by_chain<'a>(
+    q: &[u8; POINT],
+    k: u64,
+    mut cur: &'a mut [u8; POINT],
+    mut next: &'a mut [u8; POINT],
+) -> Result<&'a mut [u8; POINT], ProgramError> {
+    *cur = *q;
+    let mut top = 63u32;
+    let mut rest = k & !(1 << 63);
+    while rest != 0 {
+        let bit = 63 - rest.leading_zeros();
+        (cur, next) = double_run(cur, next, top - bit)?;
+        g2_op_to(OP_ADD, cur, q, next)?;
+        core::mem::swap(&mut cur, &mut next);
+        rest &= !(1 << bit);
+        top = bit;
     }
-    Ok(acc)
+    let (cur, _) = double_run(cur, next, top)?;
+    Ok(cur)
 }
 
 // psi's y constant is c * (1 - i): the table halves sum to the modulus.
@@ -502,13 +568,13 @@ fn psi(p: &[u8; POINT]) -> [u8; POINT] {
     let (x, y) = parse_point(p);
     // (a + bi) -> conj -> * (0, k): c0 = b*k, c1 = a*k
     let x_out = Fp2 {
-        c0: mont_mul(&x.c1, &PSI_X_C1),
-        c1: mont_mul(&x.c0, &PSI_X_C1),
+        c0: fixed::psi_x_c1(&x.c1),
+        c1: fixed::psi_x_c1(&x.c0),
     };
     // conj(y) * c(1 - i) = c ((a - b) - (a + b) i): two multiplies
     let y_out = Fp2 {
-        c0: mont_mul(&sub_mod(&y.c0, &y.c1), &PSI_Y[0]),
-        c1: neg_mod(&mont_mul(&add_mod(&y.c0, &y.c1), &PSI_Y[0])),
+        c0: fixed::psi_y(&sub_mod(&y.c0, &y.c1)),
+        c1: neg_mod(&fixed::psi_y(&add_mod(&y.c0, &y.c1))),
     };
     point_bytes(&x_out, &y_out)
 }
@@ -517,8 +583,8 @@ fn psi(p: &[u8; POINT]) -> [u8; POINT] {
 fn psi2(p: &[u8; POINT]) -> [u8; POINT] {
     let (x, y) = parse_point(p);
     let x_out = Fp2 {
-        c0: mont_mul(&x.c0, &PSI2_X_C0),
-        c1: mont_mul(&x.c1, &PSI2_X_C0),
+        c0: fixed::psi2_x_c0(&x.c0),
+        c1: fixed::psi2_x_c0(&x.c1),
     };
     point_bytes(&x_out, &neg2(&y))
 }
@@ -529,13 +595,21 @@ fn psi2(p: &[u8; POINT]) -> [u8; POINT] {
 /// ([|x|]B + A - psi(P) = [|x|]B + B), so no chain output needs negating
 /// and the second chain absorbs two of the trailing adds into one.
 pub(crate) fn clear_cofactor(p: &[u8; POINT]) -> Result<[u8; POINT], ProgramError> {
-    let a = mul_by_chain(p, BLS_X_ABS)?;
-    let t2 = psi(p);
-    let p2 = psi2(&g2_add(p, p)?);
-    let t = mul_by_chain(&g2_sub(&a, &t2)?, BLS_X_ABS + 1)?;
+    let mut x = [0u8; POINT];
+    let mut y = [0u8; POINT];
+    let mut b = [0u8; POINT];
+    let a = mul_by_chain(p, BLS_X_ABS, &mut x, &mut y)?;
+    g2_op_to(OP_SUB, a, &psi(p), &mut b)?;
+    let mut p2 = [0u8; POINT];
+    g2_op_to(OP_ADD, p, p, &mut p2)?;
+    let p2 = psi2(&p2);
+    let t = mul_by_chain(&b, BLS_X_ABS + 1, &mut x, &mut y)?;
 
-    let r = g2_add(&p2, &t)?;
-    g2_sub(&r, p)
+    let mut r = [0u8; POINT];
+    g2_op_to(OP_ADD, &p2, t, &mut r)?;
+    let mut out = [0u8; POINT];
+    g2_op_to(OP_SUB, &r, p, &mut out)?;
+    Ok(out)
 }
 
 
@@ -915,6 +989,230 @@ fn hash_to_g2_compact_inner(
     let sum = g2_add(&points[0], &points[1])?;
     let cleared = clear_cofactor(&sum)?;
     g2_validate(&cleared)?;
+    Ok(cleared.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Fat witness: 837 bytes, for transactions with room to spare (a v1
+// transaction holds 4 KiB).
+//
+// blob: flags (two branch bits), per map x, y, sigma, then per field
+// element its Montgomery form and quotient
+//
+// Every witness is a value the pipeline uses directly. x is the SSWU
+// candidate itself, pinned by one product against a constant: on the x1
+// branch x tv2 == C (tv2 + 1) for C = -B'/A', rewritten (x - C) tv2 == C,
+// and on the x2 branch x = tv1 x1 with tv2 = tv1 (tv1 + 1) gives
+// (x - C tv1)(tv1 + 1) == C, which also skips tv1^2 (scaled by 60 so every
+// factor is a small integer). sigma = 4 / t for t = x - x_k opens the iso-3
+// in Velu form (consts_g2.rs), with integer coefficients below 16:
+//   X = a3 (x + 12i sigma + (1 + i) sigma^2)
+//   Y = (c a3 / 2) y (2 - 6i sigma^2 - (1 + i) sigma^3)
+// No curve check runs on E'. Each map lands on E alone and the g2 add
+// syscall that joins them checks both images on the curve. The iso gives
+// Y^2 - X^3 - B = F^2 (y^2 - g'(x)) for F the y factor above, so an image
+// on E proves its root, and the root proves its branch (the wrong branch's
+// g'(x) is a non-square). y rides canonical, so its sign reads for free
+// and the y factor lands the output canonical with no redc.
+//
+// hash_to_field drops its multiplies the same way: each field element
+// ships as its Montgomery form w and the quotient q of its 64-byte SHA
+// value x by p. from_mont(w) is canonical, so from_mont(w) + q p == x pins
+// it to x mod p with one redc and a 65-product integer check, where the
+// fold paid two full multiplies.
+
+const FAT_MAP: usize = 3 * 96;
+const FIELD_Q: usize = 17;
+const FIELD_W: usize = 48 + FIELD_Q;
+const FAT_FIELD: usize = 1 + 2 * FAT_MAP;
+const FAT_TOTAL: usize = FAT_FIELD + 4 * FIELD_W;
+
+fn hash_to_field_g2_witnessed(dst: &[u8], msg: &[u8], wits: &[u8]) -> Result<[Elem2; 2], ProgramError> {
+    let blocks = expand_message_xmd_g2(dst, msg);
+    let mut fp = [(ZERO, ZERO); 4];
+    for (k, slot) in fp.iter_mut().enumerate() {
+        let w = &wits[k * FIELD_W..(k + 1) * FIELD_W];
+        let mont = wit48(&w[..48])?;
+        let canonical = from_mont(&mont);
+        if !quotient_matches(&blocks[2 * k], &blocks[2 * k + 1], &canonical, &w[48..]) {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        *slot = (canonical, mont);
+    }
+    Ok([
+        Elem2 { canonical: Fp2 { c0: fp[0].0, c1: fp[1].0 }, mont: Fp2 { c0: fp[0].1, c1: fp[1].1 } },
+        Elem2 { canonical: Fp2 { c0: fp[2].0, c1: fp[3].0 }, mont: Fp2 { c0: fp[2].1, c1: fp[3].1 } },
+    ])
+}
+
+/// Pin one map's SSWU candidate x with a single product. tv1 = 0 is
+/// u = 0, the RFC's exceptional case, rejected as elsewhere. A zero tv2
+/// or tv1 + 1 zeroes the product and fails the compare.
+fn pin_sswu_x(u: &Elem2, x: &Fp2, branch2: bool) -> Result<(), ProgramError> {
+    let tv1 = mul_by_xi2(&sq2(&u.mont));
+    if is_zero2(&tv1) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let ok = if branch2 {
+        // scaled by 60: (60 x - 253 (i - 1) tv1)(tv1 + 1) == 253 (i - 1),
+        // with (i - 1)(a + bi) = -(a + b) + (a - b) i
+        let (a, b) = (&tv1.c0, &tv1.c1);
+        let mut w0 = [0u64; 7];
+        wide_mac(&mut w0, &x.c0, 60);
+        wide_mac(&mut w0, a, 253);
+        wide_mac(&mut w0, b, 253);
+        let mut w1 = [0u64; 7];
+        wide_mac(&mut w1, &x.c1, 60);
+        wide_mac(&mut w1, &neg_mod(a), 253);
+        wide_mac(&mut w1, b, 253);
+        let d = Fp2 { c0: wide_reduce(&w0), c1: wide_reduce(&w1) };
+        mul2(&d, &add2(&tv1, &ONE2)) == fp2(&SSWU2_C60)
+    } else {
+        let c = fp2(&SSWU2_C1_NEG_B_OVER_A);
+        mul2(&sub2(x, &c), &add2(&sq2(&tv1), &tv1)) == c
+    };
+    if !ok {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok(())
+}
+
+/// One map onto E through the Velu-form iso-3. y is canonical, so the
+/// mixed-domain products land both coordinates canonical. A zero y factor
+/// (a ramification point, where the E check would stop pinning y) aborts.
+fn iso3_velu(x: &Fp2, y: &Fp2, sigma: &Fp2, out: &mut [u8; POINT]) -> Result<(), ProgramError> {
+    let t = sub2(x, &fp2(&ISO3V_XK));
+    if mul2(&t, sigma) != (Fp2 { c0: FOUR, c1: ZERO }) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    iso3_velu_image(x, y, sigma, out)
+}
+
+/// The iso body once sigma is pinned
+#[inline(always)]
+fn iso3_velu_image(x: &Fp2, y: &Fp2, sigma: &Fp2, out: &mut [u8; POINT]) -> Result<(), ProgramError> {
+    let s2 = sq2(sigma);
+    let s3 = mul2(&s2, sigma);
+    // 12i sigma = (-12 b, 12 a) and (1 + i) sigma^2 = (e - f, e + f), each
+    // component one small linear combination and one reduction, with
+    // negated terms entering as p - v
+    let (e, f) = (&s2.c0, &s2.c1);
+    let mut w0 = [0u64; 7];
+    wide_add(&mut w0, &x.c0);
+    wide_add(&mut w0, e);
+    wide_add(&mut w0, &neg_mod(f));
+    wide_mac(&mut w0, &neg_mod(&sigma.c1), 12);
+    let mut w1 = [0u64; 7];
+    wide_add(&mut w1, &x.c1);
+    wide_add(&mut w1, e);
+    wide_add(&mut w1, f);
+    wide_mac(&mut w1, &sigma.c0, 12);
+    let x_out = Fp2 {
+        c0: fixed::iso3v_a3(&wide_reduce(&w0)),
+        c1: fixed::iso3v_a3(&wide_reduce(&w1)),
+    };
+    // 2 - 6i sigma^2 - (1 + i) sigma^3 = (2 + 6f - g + h, -(6e + g + h))
+    let (g3, h3) = (&s3.c0, &s3.c1);
+    let mut w0 = [0u64; 7];
+    wide_add(&mut w0, &TWO);
+    wide_mac(&mut w0, f, 6);
+    wide_add(&mut w0, &neg_mod(g3));
+    wide_add(&mut w0, h3);
+    let mut w1 = [0u64; 7];
+    wide_mac(&mut w1, e, 6);
+    wide_add(&mut w1, g3);
+    wide_add(&mut w1, h3);
+    let g = Fp2 { c0: wide_reduce(&w0), c1: neg_mod(&wide_reduce(&w1)) };
+    if is_zero2(&g) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let h = mul2(y, &g);
+    let y_out = Fp2 { c0: fixed::iso3v_ca3_half(&h.c0), c1: fixed::iso3v_ca3_half(&h.c1) };
+    write_point(out, &x_out, &y_out);
+    Ok(())
+}
+
+/// Probe hooks: one iso3_velu (the t check plus the image, which runs
+/// whatever the check says) and one pin per branch (the compare fails,
+/// the work still runs).
+#[doc(hidden)]
+pub(crate) fn probe_iso3_velu(x: &Fp2) -> Fp2 {
+    let t = sub2(x, &fp2(&ISO3V_XK));
+    let _ = core::hint::black_box(mul2(&t, x));
+    let mut p = [0u8; POINT];
+    let _ = iso3_velu_image(x, x, x, &mut p);
+    let (px, py) = parse_point(&p);
+    add2(&px, &py)
+}
+
+#[doc(hidden)]
+pub(crate) fn probe_pin(x: &Fp2, branch2: bool) -> Fp2 {
+    let u = Elem2 { canonical: *x, mont: *x };
+    let _ = core::hint::black_box(pin_sswu_x(&u, x, branch2));
+    add2(x, &ONE2)
+}
+
+pub fn hash_to_g2_fat(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    hash_to_g2_fat_prefix(dst, 3, payload)
+}
+
+/// hash_to_g2_fat for a caller that feeds the point to the pairing
+/// syscall, which subgroup-checks its G2 inputs: the trailing validate
+/// only repeats that check.
+pub fn hash_to_g2_fat_for_pairing(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    hash_to_g2_fat_prefix(dst, 4, payload)
+}
+
+/// Cumulative stage prefixes: 0 hash_to_field, 1 the x pins, 2 both maps
+/// on E and their sum, 3 the full hash, 4 the full hash without the final
+/// validate
+#[doc(hidden)]
+pub fn hash_to_g2_fat_prefix(dst: &[u8], stage: u8, payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    let (wits, msg) = split_witness(payload, FAT_TOTAL)?;
+    let flags = wits[0];
+    if flags > 3 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let u = hash_to_field_g2_witnessed(dst, msg, &wits[FAT_FIELD..])?;
+    if stage == 0 {
+        return Ok(limbs_to_be(&u[0].canonical.c0).to_vec());
+    }
+
+    let mut points = [[0u8; POINT]; 2];
+    for i in 0..2 {
+        let w = &wits[1 + i * FAT_MAP..1 + (i + 1) * FAT_MAP];
+        let x = wit96(&w[..96])?;
+        let branch2 = (flags >> i) & 1 == 1;
+        pin_sswu_x(&u[i], &x, branch2)?;
+        if stage == 1 {
+            continue;
+        }
+        // gx == 0 zeroes the root on both branches, and blst takes x1
+        let y = wit96(&w[96..192])?;
+        if branch2 && is_zero2(&y) {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let y = if sgn0_fp2(&y) != sgn0_fp2(&u[i].canonical) {
+            neg2(&y)
+        } else {
+            y
+        };
+        iso3_velu(&x, &y, &wit96(&w[192..])?, &mut points[i])?;
+    }
+    if stage == 1 {
+        return Ok(limbs_to_be(&u[1].canonical.c0).to_vec());
+    }
+
+    // the add syscall checks both images on E, which pins each root
+    let mut sum = [0u8; POINT];
+    g2_op_to(OP_ADD, &points[0], &points[1], &mut sum)?;
+    if stage == 2 {
+        return Ok(sum.to_vec());
+    }
+    let cleared = clear_cofactor(&sum)?;
+    if stage == 3 {
+        g2_validate(&cleared)?;
+    }
     Ok(cleared.to_vec())
 }
 
@@ -1357,6 +1655,97 @@ pub mod witness {
     /// The honest 96-byte parity blob.
     pub fn generate_compact_parity(msg: &[u8]) -> Vec<u8> {
         generate_compact_parity_steered(msg, 0)
+    }
+
+    /// The 577-byte fat blob: flags, then per map x (Montgomery), the
+    /// sgn0-correct root y (canonical) and sigma = 4 / (x - x_k)
+    /// (Montgomery).
+    pub fn generate_fat(msg: &[u8]) -> Vec<u8> {
+        generate_fat_steered(msg, 0)
+    }
+
+    /// Branch-lie probe: a steered map ships the other SSWU candidate with
+    /// its flag flipped and sigma exact for it. That candidate's g'(x) is
+    /// a non-square, so the shipped y (a root of xi g'(x)) cannot land the
+    /// image on E, and the add syscall must refuse it.
+    #[doc(hidden)]
+    pub fn generate_fat_steered(msg: &[u8], steer: u8) -> Vec<u8> {
+        let u = hash_to_field_g2(crate::dst::G2_RO, msg);
+        let four = Fp2 { c0: FOUR, c1: ZERO };
+        let mut blob = vec![0u8];
+        for i in 0..2 {
+            let pre = sswu_pre(&u[i]).unwrap();
+            let (flag, x, gx) = select_sswu_branch(&pre, &inv2(&pre.tv2));
+            let (flag, x, y) = if (steer >> i) & 1 == 1 {
+                let x1 = mul2(&fp2(&SSWU2_C1_NEG_B_OVER_A), &add2(&ONE2, &inv2(&pre.tv2)));
+                let x = if flag == 0 { mul2(&pre.xi_usq, &x1) } else { x1 };
+                (flag ^ 1, x, sqrt2(&mul_by_xi2(&gx2_at(&x))))
+            } else {
+                (flag, x, sqrt2(&gx))
+            };
+            let mut y = from_mont2(&y);
+            if sgn0_fp2(&y) != sgn0_fp2(&u[i].canonical) {
+                y = neg2(&y);
+            }
+            let sigma = mul2(&four, &inv2(&sub2(&x, &fp2(&ISO3V_XK))));
+            blob[0] |= flag << i;
+            push_fp2_mont(&mut blob, &x);
+            push_fp2_mont(&mut blob, &y);
+            push_fp2_mont(&mut blob, &sigma);
+        }
+        let blocks = expand_message_xmd_g2(crate::dst::G2_RO, msg);
+        for k in 0..4 {
+            let e = &u[k / 2];
+            let mont = if k % 2 == 0 { e.mont.c0 } else { e.mont.c1 };
+            blob.extend_from_slice(&limbs_to_be(&mont));
+            blob.extend_from_slice(&field_quotient(&blocks[2 * k], &blocks[2 * k + 1]));
+        }
+        assert_eq!(blob.len(), FAT_TOTAL);
+        blob
+    }
+
+    /// floor((hi || lo) / p) as 17 big-endian bytes, schoolbook bits
+    fn field_quotient(hi: &[u8; 32], lo: &[u8; 32]) -> [u8; FIELD_Q] {
+        use crate::fp::{geq, sub_nocheck};
+        let mut rem = ZERO;
+        let mut q = [0u64; 3];
+        for byte in hi.iter().chain(lo.iter()) {
+            for b in (0..8).rev() {
+                let mut carry = ((byte >> b) & 1) as u64;
+                for limb in rem.iter_mut() {
+                    let top = *limb >> 63;
+                    *limb = (*limb << 1) | carry;
+                    carry = top;
+                }
+                let mut qc = 0;
+                for limb in q.iter_mut() {
+                    let top = *limb >> 63;
+                    *limb = (*limb << 1) | qc;
+                    qc = top;
+                }
+                if geq(&rem, &crate::consts_g1::MODULUS) {
+                    rem = sub_nocheck(&rem, &crate::consts_g1::MODULUS);
+                    q[0] |= 1;
+                }
+            }
+        }
+        assert!(q[2] < 256, "quotient past 136 bits");
+        let mut out = [0u8; FIELD_Q];
+        out[0] = q[2] as u8;
+        out[1..9].copy_from_slice(&q[1].to_be_bytes());
+        out[9..].copy_from_slice(&q[0].to_be_bytes());
+        out
+    }
+
+    /// The other root of one map: an equally valid witness that must
+    /// reproduce the same point.
+    pub fn flip_fat_root(blob: &[u8], map: usize) -> Vec<u8> {
+        let at = 1 + map * FAT_MAP + 96;
+        let mut out = blob.to_vec();
+        let mut root = Vec::new();
+        push_fp2_mont(&mut root, &neg2(&wit96(&blob[at..at + 96]).unwrap()));
+        out[at..at + 96].copy_from_slice(&root);
+        out
     }
 
 

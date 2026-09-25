@@ -381,3 +381,47 @@ pub const ISO3A_XDEN: [[[u64; 6]; 2]; 2] = msa2([
         ],
     ],
 ]);
+
+use crate::consts_g1::msn;
+
+/// Canonical value to the crate's Montgomery domain (x * 2^390 mod p)
+const fn mont(x: [u64; 6]) -> [u64; 6] {
+    msn(x, 390)
+}
+
+// Velu form of the iso-3, for the fat layout. The kernel point of the RFC
+// 9380 3-isogeny sits at x_k = -6 + 6i: both denominators are powers of
+// t = x - x_k (x_den = t^2, y_den = t^3), and Taylor-shifting the
+// numerators to t leaves tiny integers,
+//   X = a3 (x + 48i / t + 16 (1 + i) / t^2)
+//   Y = c a3 y (1 - 48i / t^2 - 32 (1 + i) / t^3)
+// with a3 and c real. tools/velu_iso3.py derives these from the tables
+// and checks them against the Horner map.
+
+pub const ISO3V_XK: [[u64; 6]; 2] = [
+    mont([0xb9feffffffffaaa5, 0x1eabfffeb153ffff, 0x6730d2a0f6b0f624, 0x64774b84f38512bf, 0x4b1ba7b6434bacd7, 0x1a0111ea397fe69a]),
+    mont([6, 0, 0, 0, 0, 0]),
+];
+
+/// a3, canonical: a Montgomery-form operand times it lands canonical
+pub const ISO3V_A3: [u64; 6] = [
+    0x88e2aaaaaaaa5ed1, 0x7098e38d0f671c71, 0x22d6108f142b8575,
+    0xcb14b4e7f4e810aa, 0xed6dea691f5fb614, 0x171d6541fa38ccfa,
+];
+
+/// c a3 / 2, Montgomery: the y bracket rides doubled and meets a
+/// canonical operand
+pub const ISO3V_CA3_HALF: [u64; 6] = mont([
+    0xf0d9b8e38e38c588, 0x273c84bd2b6e25ec, 0x5874bbe34d513a29,
+    0x3b0d879bd0f13143, 0xfdfb821ef1c08d68, 0x09264d6a1db67bcd,
+]);
+
+pub const FOUR: [u64; 6] = mont([4, 0, 0, 0, 0, 0]);
+pub const TWO: [u64; 6] = mont([2, 0, 0, 0, 0, 0]);
+
+/// 60 C = 253 (i - 1), Montgomery: the x2 pin scaled by 60 keeps every
+/// factor a small integer
+pub const SSWU2_C60: [[u64; 6]; 2] = [
+    mont([0xb9feffffffffa9ae, 0x1eabfffeb153ffff, 0x6730d2a0f6b0f624, 0x64774b84f38512bf, 0x4b1ba7b6434bacd7, 0x1a0111ea397fe69a]),
+    mont([253, 0, 0, 0, 0, 0]),
+];

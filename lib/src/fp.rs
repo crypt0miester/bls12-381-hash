@@ -546,6 +546,466 @@ fn pack30(r: &[u64; 13]) -> Fp {
     out
 }
 
+/// hi || lo == u + q p over the integers, for hi || lo a 64-byte
+/// big-endian value, u < 2^390 and q < 2^136 as 17 big-endian bytes.
+/// Column sums over 30-bit lanes: five q lanes against the thirteen
+/// modulus lanes keep every column below 2^63. Straight-line like the
+/// multipliers, from tools/gen_quotient.py.
+pub(crate) fn quotient_matches(hi: &[u8; 32], lo: &[u8; 32], u: &Fp, q_be: &[u8]) -> bool {
+    let mut limbs = [0u64; 8];
+    for i in 0..4 {
+        limbs[7 - i] = u64::from_be_bytes(hi[8 * i..8 * i + 8].try_into().unwrap());
+        limbs[3 - i] = u64::from_be_bytes(lo[8 * i..8 * i + 8].try_into().unwrap());
+    }
+    let ql = [
+        u64::from_be_bytes(q_be[9..17].try_into().unwrap()),
+        u64::from_be_bytes(q_be[1..9].try_into().unwrap()),
+        q_be[0] as u64,
+    ];
+    let x = [
+        limbs[0] & MASK30,
+        (limbs[0] >> 30) & MASK30,
+        ((limbs[0] >> 60) | (limbs[1] << 4)) & MASK30,
+        (limbs[1] >> 26) & MASK30,
+        ((limbs[1] >> 56) | (limbs[2] << 8)) & MASK30,
+        (limbs[2] >> 22) & MASK30,
+        ((limbs[2] >> 52) | (limbs[3] << 12)) & MASK30,
+        (limbs[3] >> 18) & MASK30,
+        ((limbs[3] >> 48) | (limbs[4] << 16)) & MASK30,
+        (limbs[4] >> 14) & MASK30,
+        ((limbs[4] >> 44) | (limbs[5] << 20)) & MASK30,
+        (limbs[5] >> 10) & MASK30,
+        ((limbs[5] >> 40) | (limbs[6] << 24)) & MASK30,
+        (limbs[6] >> 6) & MASK30,
+        ((limbs[6] >> 36) | (limbs[7] << 28)) & MASK30,
+        (limbs[7] >> 2) & MASK30,
+        (limbs[7] >> 32) & MASK30,
+        (limbs[7] >> 62) & MASK30,
+    ];
+    let q = [
+        ql[0] & MASK30,
+        (ql[0] >> 30) & MASK30,
+        ((ql[0] >> 60) | (ql[1] << 4)) & MASK30,
+        (ql[1] >> 26) & MASK30,
+        ((ql[1] >> 56) | (ql[2] << 8)) & MASK30,
+    ];
+    let u = split30(u);
+    let mut col = 0u64;
+    let mut diff = 0u64;
+    col = col.wrapping_add(u[0]);
+    dot!(col, q 0, P30 0);
+    diff |= (col & MASK30) ^ x[0];
+    col >>= 30;
+    col = col.wrapping_add(u[1]);
+    dot!(col, q 0 1, P30 1 0);
+    diff |= (col & MASK30) ^ x[1];
+    col >>= 30;
+    col = col.wrapping_add(u[2]);
+    dot!(col, q 0 1 2, P30 2 1 0);
+    diff |= (col & MASK30) ^ x[2];
+    col >>= 30;
+    col = col.wrapping_add(u[3]);
+    dot!(col, q 0 1 2 3, P30 3 2 1 0);
+    diff |= (col & MASK30) ^ x[3];
+    col >>= 30;
+    col = col.wrapping_add(u[4]);
+    dot!(col, q 0 1 2 3 4, P30 4 3 2 1 0);
+    diff |= (col & MASK30) ^ x[4];
+    col >>= 30;
+    col = col.wrapping_add(u[5]);
+    dot!(col, q 0 1 2 3 4, P30 5 4 3 2 1);
+    diff |= (col & MASK30) ^ x[5];
+    col >>= 30;
+    col = col.wrapping_add(u[6]);
+    dot!(col, q 0 1 2 3 4, P30 6 5 4 3 2);
+    diff |= (col & MASK30) ^ x[6];
+    col >>= 30;
+    col = col.wrapping_add(u[7]);
+    dot!(col, q 0 1 2 3 4, P30 7 6 5 4 3);
+    diff |= (col & MASK30) ^ x[7];
+    col >>= 30;
+    col = col.wrapping_add(u[8]);
+    dot!(col, q 0 1 2 3 4, P30 8 7 6 5 4);
+    diff |= (col & MASK30) ^ x[8];
+    col >>= 30;
+    col = col.wrapping_add(u[9]);
+    dot!(col, q 0 1 2 3 4, P30 9 8 7 6 5);
+    diff |= (col & MASK30) ^ x[9];
+    col >>= 30;
+    col = col.wrapping_add(u[10]);
+    dot!(col, q 0 1 2 3 4, P30 10 9 8 7 6);
+    diff |= (col & MASK30) ^ x[10];
+    col >>= 30;
+    col = col.wrapping_add(u[11]);
+    dot!(col, q 0 1 2 3 4, P30 11 10 9 8 7);
+    diff |= (col & MASK30) ^ x[11];
+    col >>= 30;
+    col = col.wrapping_add(u[12]);
+    dot!(col, q 0 1 2 3 4, P30 12 11 10 9 8);
+    diff |= (col & MASK30) ^ x[12];
+    col >>= 30;
+    dot!(col, q 1 2 3 4, P30 12 11 10 9);
+    diff |= (col & MASK30) ^ x[13];
+    col >>= 30;
+    dot!(col, q 2 3 4, P30 12 11 10);
+    diff |= (col & MASK30) ^ x[14];
+    col >>= 30;
+    dot!(col, q 3 4, P30 12 11);
+    diff |= (col & MASK30) ^ x[15];
+    col >>= 30;
+    dot!(col, q 4, P30 12);
+    diff |= (col & MASK30) ^ x[16];
+    col >>= 30;
+    diff |= (col & MASK30) ^ x[17];
+    col >>= 30;
+    (diff | col) == 0
+}
+
+/// x 2^-n mod p at compile time: odd values add p before the shift (x + p
+/// stays below 2^382, so no carry leaves the top limb)
+const fn c_halve(mut x: Fp, n: u32) -> Fp {
+    let mut k = 0;
+    while k < n {
+        if x[0] & 1 == 1 {
+            let mut carry = 0u64;
+            let mut i = 0;
+            while i < 6 {
+                let (s, c1) = x[i].overflowing_add(MODULUS[i]);
+                let (s, c2) = s.overflowing_add(carry);
+                x[i] = s;
+                carry = (c1 as u64) + (c2 as u64);
+                i += 1;
+            }
+        }
+        let mut i = 0;
+        while i < 6 {
+            x[i] = (x[i] >> 1) | if i < 5 { x[i + 1] << 63 } else { 0 };
+            i += 1;
+        }
+        k += 1;
+    }
+    x
+}
+
+/// Lane tables for a fixed multiplier K < p: T[i] = K 2^(30 i - 330) mod p.
+/// sum_i a_i T[i] is a K 2^60 R^-1 mod p up to multiples of p, so two
+/// Montgomery quotient lanes (2^60) finish mont_mul(a, K) with 195 products
+/// against 338, and every T lane rides as an immediate.
+pub(crate) const fn fixed_table(k: Fp) -> [[u64; 13]; 13] {
+    let mut t = [[0u64; 13]; 13];
+    t[12] = split30(&crate::consts_g1::msn(k, 30));
+    let mut v = k;
+    let mut i = 12;
+    while i > 0 {
+        i -= 1;
+        t[i] = split30(&v);
+        v = c_halve(v, 30);
+    }
+    t
+}
+
+// Straight-line body of a fixed-multiplier product (tools/gen_fixed.py):
+// column j sums the thirteen a_i T[i][j] plus the two quotient lanes'
+// modulus terms, at most fifteen products below 2^60 and a carry below
+// 2^35, so no column leaves the u64. The result stays below 2p.
+macro_rules! fixed_mul {
+    ($t:expr, $a:ident) => {{
+        let a = split30($a);
+        let mut r = [0u64; 13];
+        let mut col = 0u64;
+        col = col.wrapping_add(a[0].wrapping_mul($t[0][0]));
+        col = col.wrapping_add(a[1].wrapping_mul($t[1][0]));
+        col = col.wrapping_add(a[2].wrapping_mul($t[2][0]));
+        col = col.wrapping_add(a[3].wrapping_mul($t[3][0]));
+        col = col.wrapping_add(a[4].wrapping_mul($t[4][0]));
+        col = col.wrapping_add(a[5].wrapping_mul($t[5][0]));
+        col = col.wrapping_add(a[6].wrapping_mul($t[6][0]));
+        col = col.wrapping_add(a[7].wrapping_mul($t[7][0]));
+        col = col.wrapping_add(a[8].wrapping_mul($t[8][0]));
+        col = col.wrapping_add(a[9].wrapping_mul($t[9][0]));
+        col = col.wrapping_add(a[10].wrapping_mul($t[10][0]));
+        col = col.wrapping_add(a[11].wrapping_mul($t[11][0]));
+        col = col.wrapping_add(a[12].wrapping_mul($t[12][0]));
+        let m0 = col.wrapping_mul(INV30) & MASK30;
+        col = col.wrapping_add(m0.wrapping_mul(P30[0])) >> 30;
+        col = col.wrapping_add(a[0].wrapping_mul($t[0][1]));
+        col = col.wrapping_add(a[1].wrapping_mul($t[1][1]));
+        col = col.wrapping_add(a[2].wrapping_mul($t[2][1]));
+        col = col.wrapping_add(a[3].wrapping_mul($t[3][1]));
+        col = col.wrapping_add(a[4].wrapping_mul($t[4][1]));
+        col = col.wrapping_add(a[5].wrapping_mul($t[5][1]));
+        col = col.wrapping_add(a[6].wrapping_mul($t[6][1]));
+        col = col.wrapping_add(a[7].wrapping_mul($t[7][1]));
+        col = col.wrapping_add(a[8].wrapping_mul($t[8][1]));
+        col = col.wrapping_add(a[9].wrapping_mul($t[9][1]));
+        col = col.wrapping_add(a[10].wrapping_mul($t[10][1]));
+        col = col.wrapping_add(a[11].wrapping_mul($t[11][1]));
+        col = col.wrapping_add(a[12].wrapping_mul($t[12][1]));
+        col = col.wrapping_add(m0.wrapping_mul(P30[1]));
+        let m1 = col.wrapping_mul(INV30) & MASK30;
+        col = col.wrapping_add(m1.wrapping_mul(P30[0])) >> 30;
+        col = col.wrapping_add(a[0].wrapping_mul($t[0][2]));
+        col = col.wrapping_add(a[1].wrapping_mul($t[1][2]));
+        col = col.wrapping_add(a[2].wrapping_mul($t[2][2]));
+        col = col.wrapping_add(a[3].wrapping_mul($t[3][2]));
+        col = col.wrapping_add(a[4].wrapping_mul($t[4][2]));
+        col = col.wrapping_add(a[5].wrapping_mul($t[5][2]));
+        col = col.wrapping_add(a[6].wrapping_mul($t[6][2]));
+        col = col.wrapping_add(a[7].wrapping_mul($t[7][2]));
+        col = col.wrapping_add(a[8].wrapping_mul($t[8][2]));
+        col = col.wrapping_add(a[9].wrapping_mul($t[9][2]));
+        col = col.wrapping_add(a[10].wrapping_mul($t[10][2]));
+        col = col.wrapping_add(a[11].wrapping_mul($t[11][2]));
+        col = col.wrapping_add(a[12].wrapping_mul($t[12][2]));
+        col = col.wrapping_add(m0.wrapping_mul(P30[2])).wrapping_add(m1.wrapping_mul(P30[1]));
+        r[0] = col & MASK30;
+        col >>= 30;
+        col = col.wrapping_add(a[0].wrapping_mul($t[0][3]));
+        col = col.wrapping_add(a[1].wrapping_mul($t[1][3]));
+        col = col.wrapping_add(a[2].wrapping_mul($t[2][3]));
+        col = col.wrapping_add(a[3].wrapping_mul($t[3][3]));
+        col = col.wrapping_add(a[4].wrapping_mul($t[4][3]));
+        col = col.wrapping_add(a[5].wrapping_mul($t[5][3]));
+        col = col.wrapping_add(a[6].wrapping_mul($t[6][3]));
+        col = col.wrapping_add(a[7].wrapping_mul($t[7][3]));
+        col = col.wrapping_add(a[8].wrapping_mul($t[8][3]));
+        col = col.wrapping_add(a[9].wrapping_mul($t[9][3]));
+        col = col.wrapping_add(a[10].wrapping_mul($t[10][3]));
+        col = col.wrapping_add(a[11].wrapping_mul($t[11][3]));
+        col = col.wrapping_add(a[12].wrapping_mul($t[12][3]));
+        col = col.wrapping_add(m0.wrapping_mul(P30[3])).wrapping_add(m1.wrapping_mul(P30[2]));
+        r[1] = col & MASK30;
+        col >>= 30;
+        col = col.wrapping_add(a[0].wrapping_mul($t[0][4]));
+        col = col.wrapping_add(a[1].wrapping_mul($t[1][4]));
+        col = col.wrapping_add(a[2].wrapping_mul($t[2][4]));
+        col = col.wrapping_add(a[3].wrapping_mul($t[3][4]));
+        col = col.wrapping_add(a[4].wrapping_mul($t[4][4]));
+        col = col.wrapping_add(a[5].wrapping_mul($t[5][4]));
+        col = col.wrapping_add(a[6].wrapping_mul($t[6][4]));
+        col = col.wrapping_add(a[7].wrapping_mul($t[7][4]));
+        col = col.wrapping_add(a[8].wrapping_mul($t[8][4]));
+        col = col.wrapping_add(a[9].wrapping_mul($t[9][4]));
+        col = col.wrapping_add(a[10].wrapping_mul($t[10][4]));
+        col = col.wrapping_add(a[11].wrapping_mul($t[11][4]));
+        col = col.wrapping_add(a[12].wrapping_mul($t[12][4]));
+        col = col.wrapping_add(m0.wrapping_mul(P30[4])).wrapping_add(m1.wrapping_mul(P30[3]));
+        r[2] = col & MASK30;
+        col >>= 30;
+        col = col.wrapping_add(a[0].wrapping_mul($t[0][5]));
+        col = col.wrapping_add(a[1].wrapping_mul($t[1][5]));
+        col = col.wrapping_add(a[2].wrapping_mul($t[2][5]));
+        col = col.wrapping_add(a[3].wrapping_mul($t[3][5]));
+        col = col.wrapping_add(a[4].wrapping_mul($t[4][5]));
+        col = col.wrapping_add(a[5].wrapping_mul($t[5][5]));
+        col = col.wrapping_add(a[6].wrapping_mul($t[6][5]));
+        col = col.wrapping_add(a[7].wrapping_mul($t[7][5]));
+        col = col.wrapping_add(a[8].wrapping_mul($t[8][5]));
+        col = col.wrapping_add(a[9].wrapping_mul($t[9][5]));
+        col = col.wrapping_add(a[10].wrapping_mul($t[10][5]));
+        col = col.wrapping_add(a[11].wrapping_mul($t[11][5]));
+        col = col.wrapping_add(a[12].wrapping_mul($t[12][5]));
+        col = col.wrapping_add(m0.wrapping_mul(P30[5])).wrapping_add(m1.wrapping_mul(P30[4]));
+        r[3] = col & MASK30;
+        col >>= 30;
+        col = col.wrapping_add(a[0].wrapping_mul($t[0][6]));
+        col = col.wrapping_add(a[1].wrapping_mul($t[1][6]));
+        col = col.wrapping_add(a[2].wrapping_mul($t[2][6]));
+        col = col.wrapping_add(a[3].wrapping_mul($t[3][6]));
+        col = col.wrapping_add(a[4].wrapping_mul($t[4][6]));
+        col = col.wrapping_add(a[5].wrapping_mul($t[5][6]));
+        col = col.wrapping_add(a[6].wrapping_mul($t[6][6]));
+        col = col.wrapping_add(a[7].wrapping_mul($t[7][6]));
+        col = col.wrapping_add(a[8].wrapping_mul($t[8][6]));
+        col = col.wrapping_add(a[9].wrapping_mul($t[9][6]));
+        col = col.wrapping_add(a[10].wrapping_mul($t[10][6]));
+        col = col.wrapping_add(a[11].wrapping_mul($t[11][6]));
+        col = col.wrapping_add(a[12].wrapping_mul($t[12][6]));
+        col = col.wrapping_add(m0.wrapping_mul(P30[6])).wrapping_add(m1.wrapping_mul(P30[5]));
+        r[4] = col & MASK30;
+        col >>= 30;
+        col = col.wrapping_add(a[0].wrapping_mul($t[0][7]));
+        col = col.wrapping_add(a[1].wrapping_mul($t[1][7]));
+        col = col.wrapping_add(a[2].wrapping_mul($t[2][7]));
+        col = col.wrapping_add(a[3].wrapping_mul($t[3][7]));
+        col = col.wrapping_add(a[4].wrapping_mul($t[4][7]));
+        col = col.wrapping_add(a[5].wrapping_mul($t[5][7]));
+        col = col.wrapping_add(a[6].wrapping_mul($t[6][7]));
+        col = col.wrapping_add(a[7].wrapping_mul($t[7][7]));
+        col = col.wrapping_add(a[8].wrapping_mul($t[8][7]));
+        col = col.wrapping_add(a[9].wrapping_mul($t[9][7]));
+        col = col.wrapping_add(a[10].wrapping_mul($t[10][7]));
+        col = col.wrapping_add(a[11].wrapping_mul($t[11][7]));
+        col = col.wrapping_add(a[12].wrapping_mul($t[12][7]));
+        col = col.wrapping_add(m0.wrapping_mul(P30[7])).wrapping_add(m1.wrapping_mul(P30[6]));
+        r[5] = col & MASK30;
+        col >>= 30;
+        col = col.wrapping_add(a[0].wrapping_mul($t[0][8]));
+        col = col.wrapping_add(a[1].wrapping_mul($t[1][8]));
+        col = col.wrapping_add(a[2].wrapping_mul($t[2][8]));
+        col = col.wrapping_add(a[3].wrapping_mul($t[3][8]));
+        col = col.wrapping_add(a[4].wrapping_mul($t[4][8]));
+        col = col.wrapping_add(a[5].wrapping_mul($t[5][8]));
+        col = col.wrapping_add(a[6].wrapping_mul($t[6][8]));
+        col = col.wrapping_add(a[7].wrapping_mul($t[7][8]));
+        col = col.wrapping_add(a[8].wrapping_mul($t[8][8]));
+        col = col.wrapping_add(a[9].wrapping_mul($t[9][8]));
+        col = col.wrapping_add(a[10].wrapping_mul($t[10][8]));
+        col = col.wrapping_add(a[11].wrapping_mul($t[11][8]));
+        col = col.wrapping_add(a[12].wrapping_mul($t[12][8]));
+        col = col.wrapping_add(m0.wrapping_mul(P30[8])).wrapping_add(m1.wrapping_mul(P30[7]));
+        r[6] = col & MASK30;
+        col >>= 30;
+        col = col.wrapping_add(a[0].wrapping_mul($t[0][9]));
+        col = col.wrapping_add(a[1].wrapping_mul($t[1][9]));
+        col = col.wrapping_add(a[2].wrapping_mul($t[2][9]));
+        col = col.wrapping_add(a[3].wrapping_mul($t[3][9]));
+        col = col.wrapping_add(a[4].wrapping_mul($t[4][9]));
+        col = col.wrapping_add(a[5].wrapping_mul($t[5][9]));
+        col = col.wrapping_add(a[6].wrapping_mul($t[6][9]));
+        col = col.wrapping_add(a[7].wrapping_mul($t[7][9]));
+        col = col.wrapping_add(a[8].wrapping_mul($t[8][9]));
+        col = col.wrapping_add(a[9].wrapping_mul($t[9][9]));
+        col = col.wrapping_add(a[10].wrapping_mul($t[10][9]));
+        col = col.wrapping_add(a[11].wrapping_mul($t[11][9]));
+        col = col.wrapping_add(a[12].wrapping_mul($t[12][9]));
+        col = col.wrapping_add(m0.wrapping_mul(P30[9])).wrapping_add(m1.wrapping_mul(P30[8]));
+        r[7] = col & MASK30;
+        col >>= 30;
+        col = col.wrapping_add(a[0].wrapping_mul($t[0][10]));
+        col = col.wrapping_add(a[1].wrapping_mul($t[1][10]));
+        col = col.wrapping_add(a[2].wrapping_mul($t[2][10]));
+        col = col.wrapping_add(a[3].wrapping_mul($t[3][10]));
+        col = col.wrapping_add(a[4].wrapping_mul($t[4][10]));
+        col = col.wrapping_add(a[5].wrapping_mul($t[5][10]));
+        col = col.wrapping_add(a[6].wrapping_mul($t[6][10]));
+        col = col.wrapping_add(a[7].wrapping_mul($t[7][10]));
+        col = col.wrapping_add(a[8].wrapping_mul($t[8][10]));
+        col = col.wrapping_add(a[9].wrapping_mul($t[9][10]));
+        col = col.wrapping_add(a[10].wrapping_mul($t[10][10]));
+        col = col.wrapping_add(a[11].wrapping_mul($t[11][10]));
+        col = col.wrapping_add(a[12].wrapping_mul($t[12][10]));
+        col = col.wrapping_add(m0.wrapping_mul(P30[10])).wrapping_add(m1.wrapping_mul(P30[9]));
+        r[8] = col & MASK30;
+        col >>= 30;
+        col = col.wrapping_add(a[0].wrapping_mul($t[0][11]));
+        col = col.wrapping_add(a[1].wrapping_mul($t[1][11]));
+        col = col.wrapping_add(a[2].wrapping_mul($t[2][11]));
+        col = col.wrapping_add(a[3].wrapping_mul($t[3][11]));
+        col = col.wrapping_add(a[4].wrapping_mul($t[4][11]));
+        col = col.wrapping_add(a[5].wrapping_mul($t[5][11]));
+        col = col.wrapping_add(a[6].wrapping_mul($t[6][11]));
+        col = col.wrapping_add(a[7].wrapping_mul($t[7][11]));
+        col = col.wrapping_add(a[8].wrapping_mul($t[8][11]));
+        col = col.wrapping_add(a[9].wrapping_mul($t[9][11]));
+        col = col.wrapping_add(a[10].wrapping_mul($t[10][11]));
+        col = col.wrapping_add(a[11].wrapping_mul($t[11][11]));
+        col = col.wrapping_add(a[12].wrapping_mul($t[12][11]));
+        col = col.wrapping_add(m0.wrapping_mul(P30[11])).wrapping_add(m1.wrapping_mul(P30[10]));
+        r[9] = col & MASK30;
+        col >>= 30;
+        col = col.wrapping_add(a[0].wrapping_mul($t[0][12]));
+        col = col.wrapping_add(a[1].wrapping_mul($t[1][12]));
+        col = col.wrapping_add(a[2].wrapping_mul($t[2][12]));
+        col = col.wrapping_add(a[3].wrapping_mul($t[3][12]));
+        col = col.wrapping_add(a[4].wrapping_mul($t[4][12]));
+        col = col.wrapping_add(a[5].wrapping_mul($t[5][12]));
+        col = col.wrapping_add(a[6].wrapping_mul($t[6][12]));
+        col = col.wrapping_add(a[7].wrapping_mul($t[7][12]));
+        col = col.wrapping_add(a[8].wrapping_mul($t[8][12]));
+        col = col.wrapping_add(a[9].wrapping_mul($t[9][12]));
+        col = col.wrapping_add(a[10].wrapping_mul($t[10][12]));
+        col = col.wrapping_add(a[11].wrapping_mul($t[11][12]));
+        col = col.wrapping_add(a[12].wrapping_mul($t[12][12]));
+        col = col.wrapping_add(m0.wrapping_mul(P30[12])).wrapping_add(m1.wrapping_mul(P30[11]));
+        r[10] = col & MASK30;
+        col >>= 30;
+        col = col.wrapping_add(m1.wrapping_mul(P30[12]));
+        r[11] = col & MASK30;
+        r[12] = col >> 30;
+        pack30(&r)
+    }};
+}
+
+
+/// One fixed multiplier per constant, out of line: each body is ~700
+/// instructions of immediates.
+macro_rules! fixed_mul_fn {
+    ($name:ident, $table:ident) => {
+        #[inline(never)]
+        pub(crate) fn $name(a: &Fp) -> Fp {
+            fixed_mul!($table, a)
+        }
+    };
+}
+
+
+/// Seven-limb accumulator for linear combinations with small integer
+/// factors: terms add in unreduced and one reduction lands the sum.
+pub(crate) type Wide = [u64; 7];
+
+const MASK32: u64 = 0xffff_ffff;
+
+/// acc += a k for a < 2^384 and k < 2^16, over 32-bit halves (the ISA has
+/// no wide multiply)
+#[inline(always)]
+pub(crate) fn wide_mac(acc: &mut Wide, a: &Fp, k: u64) {
+    let mut cm = 0u64;
+    let mut ca = 0u64;
+    for i in 0..6 {
+        let lo = (a[i] & MASK32).wrapping_mul(k).wrapping_add(cm);
+        let hi = (a[i] >> 32).wrapping_mul(k).wrapping_add(lo >> 32);
+        cm = hi >> 32;
+        let (s1, o1) = acc[i].overflowing_add((lo & MASK32) | (hi << 32));
+        let (s2, o2) = s1.overflowing_add(ca);
+        acc[i] = s2;
+        ca = (o1 | o2) as u64;
+    }
+    acc[6] = acc[6].wrapping_add(cm).wrapping_add(ca);
+}
+
+/// acc += a
+#[inline(always)]
+pub(crate) fn wide_add(acc: &mut Wide, a: &Fp) {
+    let mut c = 0u64;
+    for i in 0..6 {
+        let (s, c1) = adc(acc[i], a[i], c);
+        acc[i] = s;
+        c = c1;
+    }
+    acc[6] = acc[6].wrapping_add(c);
+}
+
+/// (p >> 336) + 1: dividing v >> 336 by it undershoots floor(v / p) by at
+/// most one for any v below 2^400
+const P_TOP_PLUS1: u64 = (MODULUS[5] >> 16) + 1;
+
+/// v mod p for v < 2^400: one div64 estimates the quotient from the top
+/// bits (never above floor(v / p), at most one below, since v >> 336 is
+/// under 2^64 and p >> 336 over 2^44), a 32-bit-half multiply subtracts
+/// it, and one conditional subtraction finishes.
+#[inline(always)]
+pub(crate) fn wide_reduce(v: &Wide) -> Fp {
+    let q = ((v[5] >> 16) | (v[6] << 48)) / P_TOP_PLUS1;
+    let mut r = [0u64; 6];
+    let mut cm = 0u64;
+    let mut br = 0u64;
+    for i in 0..6 {
+        let lo = (MODULUS[i] & MASK32).wrapping_mul(q).wrapping_add(cm);
+        let hi = (MODULUS[i] >> 32).wrapping_mul(q).wrapping_add(lo >> 32);
+        cm = hi >> 32;
+        let (d, b) = sbb(v[i], (lo & MASK32) | (hi << 32), br);
+        r[i] = d;
+        br = b;
+    }
+    debug_assert_eq!(v[6].wrapping_sub(cm).wrapping_sub(br), 0);
+    if geq(&r, &MODULUS) {
+        r = sub_nocheck(&r, &MODULUS);
+    }
+    debug_assert!(!geq(&r, &MODULUS));
+    r
+}
+
 /// Each operand lane doubled, for the squaring cross products
 #[inline(always)]
 fn double_lanes(a: &[u64; 13]) -> [u64; 13] {
@@ -903,4 +1363,98 @@ pub(crate) fn from_mont(x: &Fp) -> Fp {
     debug_assert!(sum <= MASK30);
     r[12] = sum;
     pack30(&r)
+}
+
+/// Host guard for the small linear combinations: wide_mac / wide_add /
+/// wide_reduce against add_mod chains, over edges and varied residues, up
+/// to the largest combination the pipeline builds (566 p).
+#[cfg(not(target_os = "solana"))]
+pub fn wide_selftest() {
+    use crate::consts_g1::{R, R2};
+    let small = |a: &Fp, k: u64| {
+        let mut r = [0u64; 6];
+        for _ in 0..k {
+            r = add_mod(&r, a);
+        }
+        r
+    };
+    let mut samples: alloc::vec::Vec<Fp> = alloc::vec![
+        [0; 6],
+        [1, 0, 0, 0, 0, 0],
+        R,
+        R2,
+        sub_nocheck(&MODULUS, &[1, 0, 0, 0, 0, 0]),
+    ];
+    let mut x = R2;
+    for i in 0..200u64 {
+        x = add_mod(&mont_mul(&x, &R2), &[i, 3, 0, 0, 0, 0]);
+        samples.push(x);
+    }
+    let top = sub_nocheck(&MODULUS, &[1, 0, 0, 0, 0, 0]);
+    for a in &samples {
+        for &(k1, k2, k3) in &[(1u64, 1u64, 1u64), (60, 253, 253), (6, 1, 1), (12, 1, 1), (1, 0, 0)] {
+            let mut w = [0u64; 7];
+            wide_mac(&mut w, a, k1);
+            wide_mac(&mut w, &top, k2);
+            wide_mac(&mut w, &neg_mod(a), k3);
+            wide_add(&mut w, a);
+            let want = add_mod(
+                &add_mod(&small(a, k1), &small(&top, k2)),
+                &add_mod(&small(&neg_mod(a), k3), a),
+            );
+            assert_eq!(wide_reduce(&w), want, "wide combination != add_mod chain");
+        }
+    }
+}
+
+/// The fixed multipliers the fat pipeline uses: each one equals
+/// mont_mul(a, K) for its constant K, for any a below 2^384.
+pub(crate) mod fixed {
+    use super::*;
+    use crate::consts_g2::{ISO3V_A3, ISO3V_CA3_HALF, PSI2_X_C0, PSI_X_C1, PSI_Y};
+
+    const T_ISO3V_A3: [[u64; 13]; 13] = fixed_table(ISO3V_A3);
+    const T_ISO3V_CA3_HALF: [[u64; 13]; 13] = fixed_table(ISO3V_CA3_HALF);
+    const T_PSI_X_C1: [[u64; 13]; 13] = fixed_table(PSI_X_C1);
+    const T_PSI_Y: [[u64; 13]; 13] = fixed_table(PSI_Y[0]);
+    const T_PSI2_X_C0: [[u64; 13]; 13] = fixed_table(PSI2_X_C0);
+
+    fixed_mul_fn!(iso3v_a3, T_ISO3V_A3);
+    fixed_mul_fn!(iso3v_ca3_half, T_ISO3V_CA3_HALF);
+    fixed_mul_fn!(psi_x_c1, T_PSI_X_C1);
+    fixed_mul_fn!(psi_y, T_PSI_Y);
+    fixed_mul_fn!(psi2_x_c0, T_PSI2_X_C0);
+
+    /// Host guard: every fixed multiplier against mont_mul over edges,
+    /// unreduced operands up to 2^384 and a chain of varied residues.
+    #[cfg(not(target_os = "solana"))]
+    pub fn selftest() {
+        use crate::consts_g1::{R, R2};
+        let cases: [(fn(&Fp) -> Fp, Fp); 5] = [
+            (iso3v_a3, ISO3V_A3),
+            (iso3v_ca3_half, ISO3V_CA3_HALF),
+            (psi_x_c1, PSI_X_C1),
+            (psi_y, PSI_Y[0]),
+            (psi2_x_c0, PSI2_X_C0),
+        ];
+        let mut samples: alloc::vec::Vec<Fp> = alloc::vec![
+            [0; 6],
+            [1, 0, 0, 0, 0, 0],
+            R,
+            R2,
+            sub_nocheck(&MODULUS, &[1, 0, 0, 0, 0, 0]),
+            [u64::MAX; 6],
+        ];
+        let mut x = R2;
+        for i in 0..300u64 {
+            x = add_mod(&mont_mul(&x, &R2), &[i, 7, 0, 0, 0, 0]);
+            samples.push(x);
+            samples.push(add_unreduced(&add_unreduced(&x, &MODULUS), &MODULUS));
+        }
+        for (f, k) in cases {
+            for s in &samples {
+                assert_eq!(f(s), mont_mul(s, &k), "fixed multiplier != mont_mul");
+            }
+        }
+    }
 }

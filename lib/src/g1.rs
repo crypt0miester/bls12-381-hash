@@ -561,6 +561,11 @@ pub mod witness {
 
     /// Correctness guard: the bare Montgomery reduction must equal the general
     /// multiply by ONE at arbitrary points, edge cases included.
+    pub fn fixed_selftest() {
+        crate::fp::fixed::selftest();
+        crate::fp::wide_selftest();
+    }
+
     pub fn redc_selftest() {
         use crate::consts_g1::MODULUS;
         let one: Fp = [1, 0, 0, 0, 0, 0];

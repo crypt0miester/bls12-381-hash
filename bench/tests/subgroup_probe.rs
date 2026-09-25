@@ -4,6 +4,8 @@
 //! real subgroup check (not just on-curve), and the pairing syscall
 //! re-validates its inputs (which is what makes the final validate pure
 //! defense-in-depth for a pairing-bound consumer like the min-pk verify).
+//! The fat layout also needs the add syscall to refuse off-curve inputs:
+//! that refusal is what pins each map's square root.
 
 use bls12_381::{G1Affine, G2Affine};
 use mollusk_svm::{program::loader_keys::LOADER_V3, Mollusk};
@@ -59,4 +61,17 @@ fn syscall_subgroup_contract() {
     data.extend_from_slice(&uncleared);
     let a = mollusk.process_instruction(&Instruction::new_with_bytes(ID, &data, vec![]), &[]);
     assert_eq!(a.return_data[0], 0, "g2 add rejected a pre-clearing point");
+
+    // and it must refuse an off-curve input: one flipped bit of y.c0
+    let mut off = uncleared;
+    off[191] ^= 1;
+    assert!(G2Affine::from_uncompressed_unchecked(&off).is_none().into() || {
+        let q = G2Affine::from_uncompressed_unchecked(&off).unwrap();
+        !bool::from(q.is_on_curve())
+    });
+    let mut data = vec![11u8];
+    data.extend_from_slice(&off);
+    data.extend_from_slice(&uncleared);
+    let a = mollusk.process_instruction(&Instruction::new_with_bytes(ID, &data, vec![]), &[]);
+    assert_ne!(a.return_data[0], 0, "g2 add accepted an off-curve point");
 }

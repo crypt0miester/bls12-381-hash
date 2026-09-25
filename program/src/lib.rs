@@ -5,7 +5,8 @@ use core::hint::black_box;
 use bls381_hash::dst::{G1_NU, G1_RO, G2_NU, G2_RO};
 use bls381_hash::{
     encode_to_g1, encode_to_g2, hash_to_g1, hash_to_g1_modexp, hash_to_g2,
-    hash_to_g2_compact, hash_to_g2_compact_parity, hash_to_g2_compact_xgcd,
+    hash_to_g2_compact, hash_to_g2_compact_parity, hash_to_g2_compact_xgcd, hash_to_g2_fat,
+    hash_to_g2_fat_for_pairing,
 };
 
 use bls12_381::{
@@ -412,6 +413,25 @@ fn process_instruction(
             set_return_data(&out);
         }
         58 => min_pk_verify_with(payload, bls381_hash::hash_to_g2_modexp)?,
+        // Fat-witness hash_to_G2 (577 bytes), its min-pk e2e verify, and
+        // its stage prefixes (payload: stage byte, blob, msg).
+        60 => {
+            let out = hash_to_g2_fat(G2_RO, payload)?;
+            set_return_data(&out);
+        }
+        61 => min_pk_verify_with(payload, hash_to_g2_fat_for_pairing)?,
+        // The fat verify with the byte-for-CU trades a v1 transaction
+        // affords: the signature and the absentee keys ride uncompressed,
+        // so no decompress syscall runs (the pairing and the sub op check
+        // the curve, the pairing the subgroup).
+        63 => min_pk_verify_uncompressed(payload)?,
+        62 => {
+            let (&stage, rest) = payload
+                .split_first()
+                .ok_or(ProgramError::InvalidInstructionData)?;
+            let out = bls381_hash::hash_to_g2_fat_prefix(G2_RO, stage, rest)?;
+            set_return_data(&out);
+        }
         // Witnessed pipeline stage prefixes: payload is stage byte, blob, msg.
         46 => {
             let (&stage, rest) = payload
@@ -574,6 +594,68 @@ fn min_pk_verify_with(
             GT as u64,
             &mut cmp,
         )
+    };
+    if cmp != 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    set_return_data(&[1]);
+    Ok(())
+}
+
+/// Tag 63 body: absent count, aggregate, signature (192 bytes), absentee
+/// keys (96 bytes each), fat blob, message.
+fn min_pk_verify_uncompressed(payload: &[u8]) -> ProgramResult {
+    let absent = payload[0] as usize;
+    let agg_end = 1 + G1_POINT;
+    let sig_end = agg_end + G2_POINT;
+    let abs_end = sig_end + G1_POINT * absent;
+    if payload.len() < abs_end {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut g1s = [0u8; 2 * G1_POINT];
+    g1s[..G1_POINT].copy_from_slice(&payload[1..agg_end]);
+    g1s[G1_POINT..].copy_from_slice(&NEG_G1_GEN);
+    for i in 0..absent {
+        let member = &payload[sig_end + i * G1_POINT..sig_end + (i + 1) * G1_POINT];
+        let mut out = core::mem::MaybeUninit::<[u8; G1_POINT]>::uninit();
+        let rc = unsafe {
+            sys::sol_curve_group_op(
+                BLS12_381_G1_BE,
+                OP_SUB,
+                g1s.as_ptr(),
+                member.as_ptr(),
+                out.as_mut_ptr() as *mut u8,
+            )
+        };
+        if rc != 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        // SAFETY: rc == 0 means the syscall wrote the whole point
+        g1s[..G1_POINT].copy_from_slice(unsafe { &out.assume_init() });
+    }
+
+    let hash_point = hash_to_g2_fat_for_pairing(G2_RO, &payload[abs_end..])?;
+    let mut g2s = [0u8; 2 * G2_POINT];
+    g2s[..G2_POINT].copy_from_slice(&hash_point);
+    g2s[G2_POINT..].copy_from_slice(&payload[agg_end..sig_end]);
+
+    let mut gt = core::mem::MaybeUninit::<[u8; GT]>::uninit();
+    let rc = unsafe {
+        sys::sol_curve_pairing_map(
+            BLS12_381_PAIRING_BE,
+            2,
+            g1s.as_ptr(),
+            g2s.as_ptr(),
+            gt.as_mut_ptr() as *mut u8,
+        )
+    };
+    if rc != 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut cmp = 0i32;
+    unsafe {
+        sys::sol_memcmp_(gt.as_ptr() as *const u8, GT_ONE.as_ptr(), GT as u64, &mut cmp)
     };
     if cmp != 0 {
         return Err(ProgramError::InvalidInstructionData);
