@@ -1370,3 +1370,100 @@ fn fat_matches_blst_across_messages() {
     println!("fat sweep: 256 messages blst-equal, branch flags seen {flags_seen:?}");
     assert!(flags_seen.iter().all(|&n| n > 0), "sweep missed a branch combination");
 }
+
+// Empty and identity keys or signatures must never verify. All-zero bytes
+// fail the curve syscalls outright (no compression flag, or (0, 0) off the
+// curve). The identity encodings (0x40 / 0xc0 then zeros) decode cleanly, and
+// an identity key with an identity signature satisfies the pairing for any
+// message, so the verifiers screen them on the encoding. Covers every verify
+// tag: the stored aggregate as identity, a committee whose absentees cancel
+// it, an identity absentee, and zero bytes in each slot.
+#[test]
+fn verify_rejects_empty_and_identity_points() {
+    use blst::min_pk::{AggregatePublicKey, AggregateSignature, PublicKey, SecretKey, Signature};
+
+    let mollusk = mollusk();
+    let keys: Vec<SecretKey> = (0..20u8).map(|i| SecretKey::key_gen(&[i + 1; 32], &[]).unwrap()).collect();
+    let pks: Vec<PublicKey> = keys.iter().map(|s| s.sk_to_pk()).collect();
+    let refs: Vec<&PublicKey> = pks.iter().collect();
+    let agg = AggregatePublicKey::aggregate(&refs, false).unwrap().to_public_key();
+    let sigs: Vec<Signature> = keys.iter().map(|s| s.sign(MESSAGE, DST_G2, &[])).collect();
+    let sig_refs: Vec<&Signature> = sigs.iter().collect();
+    let agg_sig = AggregateSignature::aggregate(&sig_refs, false).unwrap().to_signature();
+
+    let mut id_g1 = [0u8; 96];
+    id_g1[0] = 0x40;
+    let mut id_g1c = [0u8; 48];
+    id_g1c[0] = 0xc0;
+    let mut id_g2 = [0u8; 192];
+    id_g2[0] = 0x40;
+    let mut id_g2c = [0u8; 96];
+    id_g2c[0] = 0xc0;
+
+    // compressed-signature tags and their witness generators
+    type Gen = fn(&[u8]) -> Vec<u8>;
+    let tags: [(u8, Gen); 6] = [
+        (51, bls381_hash::witness::g2::generate),
+        (54, bls381_hash::witness::g2::generate_compact),
+        (55, bls381_hash::witness::g2::generate_compact_xgcd),
+        (56, bls381_hash::witness::g2::generate_compact_parity),
+        (58, |_| Vec::new()),
+        (61, bls381_hash::witness::g2::generate_fat),
+    ];
+    for (tag, gen) in tags {
+        let witness = gen(MESSAGE);
+        let build = |agg: &[u8], sig: &[u8], absent: &[Vec<u8>]| {
+            let mut p = vec![absent.len() as u8];
+            p.extend_from_slice(agg);
+            p.extend_from_slice(sig);
+            for a in absent {
+                p.extend_from_slice(a);
+            }
+            p.extend_from_slice(&witness);
+            p.extend_from_slice(MESSAGE);
+            p
+        };
+        let honest = build(&agg.serialize(), &agg_sig.compress(), &[]);
+        assert!(!run(&mollusk, tag, &honest).program_result.is_err(), "tag {tag}: honest verify rejected");
+
+        let every: Vec<Vec<u8>> = pks.iter().map(|pk| pk.compress().to_vec()).collect();
+        let cases: [(&str, Vec<u8>); 6] = [
+            ("identity aggregate + identity signature", build(&id_g1, &id_g2c, &[])),
+            ("absentees cancel the aggregate + identity signature", build(&agg.serialize(), &id_g2c, &every)),
+            ("identity absentee", build(&agg.serialize(), &agg_sig.compress(), &[id_g1c.to_vec()])),
+            ("zero aggregate + identity signature", build(&[0u8; 96], &id_g2c, &[])),
+            ("zero signature", build(&agg.serialize(), &[0u8; 96], &[])),
+            ("zero absentee", build(&agg.serialize(), &agg_sig.compress(), &[vec![0u8; 48]])),
+        ];
+        for (label, payload) in cases {
+            assert!(run(&mollusk, tag, &payload).program_result.is_err(), "tag {tag}: {label} accepted");
+        }
+    }
+
+    // tag 63: uncompressed signature and absentee keys
+    let witness = bls381_hash::witness::g2::generate_fat(MESSAGE);
+    let build = |agg: &[u8], sig: &[u8], absent: &[Vec<u8>]| {
+        let mut p = vec![absent.len() as u8];
+        p.extend_from_slice(agg);
+        p.extend_from_slice(sig);
+        for a in absent {
+            p.extend_from_slice(a);
+        }
+        p.extend_from_slice(&witness);
+        p.extend_from_slice(MESSAGE);
+        p
+    };
+    assert!(!run(&mollusk, 63, &build(&agg.serialize(), &agg_sig.serialize(), &[])).program_result.is_err());
+    let every: Vec<Vec<u8>> = pks.iter().map(|pk| pk.serialize().to_vec()).collect();
+    let cases: [(&str, Vec<u8>); 6] = [
+        ("identity aggregate + identity signature", build(&id_g1, &id_g2, &[])),
+        ("absentees cancel the aggregate + identity signature", build(&agg.serialize(), &id_g2, &every)),
+        ("identity absentee", build(&agg.serialize(), &agg_sig.serialize(), &[id_g1.to_vec()])),
+        ("zero aggregate + identity signature", build(&[0u8; 96], &id_g2, &[])),
+        ("zero signature", build(&agg.serialize(), &[0u8; 192], &[])),
+        ("zero absentee", build(&agg.serialize(), &agg_sig.serialize(), &[vec![0u8; 96]])),
+    ];
+    for (label, payload) in cases {
+        assert!(run(&mollusk, 63, &payload).program_result.is_err(), "tag 63: {label} accepted");
+    }
+}

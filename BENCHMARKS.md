@@ -66,8 +66,8 @@ absentee keys), at bench commit of 2026-09-25:
 | roots, iso-3 per map, E add | 47,535 |
 | clear_cofactor + validate | 37,735 |
 | total (16 messages min / avg / max) | 113,828 / 115,619 / 118,538 |
-| verify k=14 / k=20 | 169,404 / 155,793 |
-| verify k=14 / k=20, uncompressed inputs | 153,706 / 152,737 |
+| verify k=14 / k=20 | 169,434 / 155,799 |
+| verify k=14 / k=20, uncompressed inputs | 153,735 / 152,747 |
 
 The blob is 837 bytes: a flags byte, per map x, y and sigma (96 bytes
 each), and per field element its Montgomery form and 17-byte quotient.
@@ -87,7 +87,10 @@ all. y ships canonical, which makes its sign free and lands Y canonical
 with no redc. hash_to_field checks from_mont(w) + q p == x over the
 integers (65 lane products) in place of the fold's two multiplies. Per
 map the verifier spends 2 sq2 + 4 mul2 + 4 fixed multiplies (one sq2
-fewer on the x2 branch). The soundness sweep flips every blob bit, the
+fewer on the x2 branch). Every verify fixture refuses identity keys and signatures on the
+encoding (an identity key with an identity signature satisfies the pairing
+for any message, and the curve syscalls accept the identity), about 5 CU
+per point, and all-zero bytes fail the syscalls' own checks. The soundness sweep flips every blob bit, the
 steered generator ships the other branch's x with a consistent sigma and
 must abort, either root of either map reproduces the point, and 256
 messages covering all four branch combinations match blst byte for byte.
@@ -100,11 +103,11 @@ byte-bound transactions (hash tags 48/49/50, end-to-end verify tags
 
 | layout | blob | hash CU | e2e verify k=14 / k=20 |
 |---|---|---|---|
-| fat | 837 B | 116,108 | 169,404 / 155,793 |
-| default | 530 B | 189,863 | 245,168 / 231,515 |
-| compact | 145 B | 335,709 | 390,984 / 377,373 |
-| xgcd | 97 B | 374,551 | 429,824 / 416,213 |
-| parity | 96 B | 374,501 | 429,774 / 416,163 |
+| fat | 837 B | 116,108 | 169,434 / 155,799 |
+| default | 530 B | 189,863 | 245,209 / 231,520 |
+| compact | 145 B | 335,709 | 391,014 / 377,379 |
+| xgcd | 97 B | 374,551 | 429,854 / 416,219 |
+| parity | 96 B | 374,501 | 429,804 / 416,169 |
 | modexp | 0 B | 257,321 | (tag 58) - / 298,982 |
 
 The witness-free-inverse rows move a little with the message (the divsteps
@@ -412,7 +415,7 @@ pricing.
   the final validate, which the pairing syscall repeats (-2.2k on the
   verify). A v1 verify can also ship the signature and absentee keys
   uncompressed (+96 and +48 bytes each) and skip every decompress: tag 63
-  measures 153,706 at k=14 against 169,404.
+  measures 153,735 at k=14 against 169,434.
 
 ## Measured dead ends
 

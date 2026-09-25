@@ -278,7 +278,8 @@ fn process_instruction(
             set_return_data(&out);
         }
         // End-to-end min-pk vote verify: witness hash_to_G2, subtract the
-        // absentees from the stored committee aggregate, then check the
+        // absentees from the stored committee aggregate (identity keys and
+        // signatures refused on the encoding), then check the
         // pairing equation as one two-pair product,
         // e(effective_pk, H) * e(-g1_gen, sig) == 1 in GT. The pairs share
         // the final exponentiation that two separate calls each pay (~13k
@@ -296,6 +297,7 @@ fn process_instruction(
             let mut effective: [u8; G1_POINT] = payload[1..agg_end].try_into().unwrap();
             for i in 0..absent {
                 let compressed = &payload[sig_end + i * 48..sig_end + (i + 1) * 48];
+                reject_identity(compressed)?;
                 let mut member = core::mem::MaybeUninit::<[u8; G1_POINT]>::uninit();
                 let rc = unsafe {
                     sys::sol_curve_decompress(
@@ -324,6 +326,8 @@ fn process_instruction(
                 effective = unsafe { out.assume_init() };
             }
 
+            reject_identity(&effective)?;
+            reject_identity(&payload[agg_end..sig_end])?;
             let hash = hash_to_g2(G2_RO, &payload[abs_end..])?;
 
             // g1 and g2 sides of the two pairs, contiguous for the syscall;
@@ -524,6 +528,7 @@ fn min_pk_verify_with(
     let mut effective: [u8; G1_POINT] = payload[1..agg_end].try_into().unwrap();
     for i in 0..absent {
         let compressed = &payload[sig_end + i * 48..sig_end + (i + 1) * 48];
+        reject_identity(compressed)?;
         let mut member = core::mem::MaybeUninit::<[u8; G1_POINT]>::uninit();
         let rc = unsafe {
             sys::sol_curve_decompress(
@@ -552,6 +557,8 @@ fn min_pk_verify_with(
         effective = unsafe { out.assume_init() };
     }
 
+    reject_identity(&effective)?;
+    reject_identity(&payload[agg_end..sig_end])?;
     let hash_point = hash(G2_RO, &payload[abs_end..])?;
 
     let mut g1s = [0u8; 2 * G1_POINT];
@@ -618,6 +625,7 @@ fn min_pk_verify_uncompressed(payload: &[u8]) -> ProgramResult {
     g1s[G1_POINT..].copy_from_slice(&NEG_G1_GEN);
     for i in 0..absent {
         let member = &payload[sig_end + i * G1_POINT..sig_end + (i + 1) * G1_POINT];
+        reject_identity(member)?;
         let mut out = core::mem::MaybeUninit::<[u8; G1_POINT]>::uninit();
         let rc = unsafe {
             sys::sol_curve_group_op(
@@ -635,6 +643,8 @@ fn min_pk_verify_uncompressed(payload: &[u8]) -> ProgramResult {
         g1s[..G1_POINT].copy_from_slice(unsafe { &out.assume_init() });
     }
 
+    reject_identity(&g1s[..G1_POINT])?;
+    reject_identity(&payload[agg_end..sig_end])?;
     let hash_point = hash_to_g2_fat_for_pairing(G2_RO, &payload[abs_end..])?;
     let mut g2s = [0u8; 2 * G2_POINT];
     g2s[..G2_POINT].copy_from_slice(&hash_point);
@@ -661,6 +671,18 @@ fn min_pk_verify_uncompressed(payload: &[u8]) -> ProgramResult {
         return Err(ProgramError::InvalidInstructionData);
     }
     set_return_data(&[1]);
+    Ok(())
+}
+
+/// Refuse the point at infinity by its encoding flag (0x40 in the first
+/// byte of every compressed and uncompressed form). The curve syscalls
+/// accept it, and an identity key with an identity signature satisfies the
+/// pairing for any message. All-zero bytes carry no flag and fail the
+/// syscalls' own encoding and curve checks.
+fn reject_identity(encoding: &[u8]) -> ProgramResult {
+    if encoding[0] & 0x40 != 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     Ok(())
 }
 
