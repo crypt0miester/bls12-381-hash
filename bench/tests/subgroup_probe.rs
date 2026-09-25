@@ -69,9 +69,11 @@ fn syscall_subgroup_contract() {
         let q = G2Affine::from_uncompressed_unchecked(&off).unwrap();
         !bool::from(q.is_on_curve())
     });
-    let mut data = vec![11u8];
-    data.extend_from_slice(&off);
-    data.extend_from_slice(&uncleared);
-    let a = mollusk.process_instruction(&Instruction::new_with_bytes(ID, &data, vec![]), &[]);
-    assert_ne!(a.return_data[0], 0, "g2 add accepted an off-curve point");
+    for (left, right, side) in [(&off, &uncleared, "left"), (&uncleared, &off, "right")] {
+        let mut data = vec![11u8];
+        data.extend_from_slice(left);
+        data.extend_from_slice(right);
+        let a = mollusk.process_instruction(&Instruction::new_with_bytes(ID, &data, vec![]), &[]);
+        assert_ne!(a.return_data[0], 0, "g2 add accepted an off-curve {side} operand");
+    }
 }
