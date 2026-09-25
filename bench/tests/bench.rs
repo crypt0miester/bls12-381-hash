@@ -1496,3 +1496,38 @@ fn fat_blst_generator_matches_portable() {
     assert!(!r.program_result.is_err());
     assert_eq!(r.return_data, blst_hash_g2_serialized(MESSAGE).to_vec());
 }
+
+fn refused_cleanly(r: &InstructionResult) -> bool {
+    format!("{:?}", r.program_result) == "Failure(InvalidInstructionData)"
+}
+
+// Out-of-range stages are refused, the last stage is the full validated
+// hash, and short or empty payloads get a clean error on every entry point
+// (a panic would surface as an unknown error instead).
+#[test]
+fn fat_stage_bounds_and_short_payloads() {
+    let mollusk = mollusk();
+    let witness = bls381_hash::witness::g2::generate_fat(MESSAGE);
+    let mut full = witness.clone();
+    full.extend_from_slice(MESSAGE);
+    let hash = run(&mollusk, 60, &full);
+    assert!(!hash.program_result.is_err());
+
+    let staged = |stage: u8| {
+        let mut p = vec![stage];
+        p.extend_from_slice(&full);
+        run(&mollusk, 62, &p)
+    };
+    assert_eq!(staged(3).return_data, hash.return_data, "stage 3 is the full hash");
+    for stage in [4u8, 5, 200, 255] {
+        assert!(refused_cleanly(&staged(stage)), "stage {stage} not refused");
+    }
+
+    for tag in [51u8, 54, 55, 56, 58, 60, 61, 62, 63] {
+        assert!(refused_cleanly(&run(&mollusk, tag, &[])), "tag {tag}: empty payload");
+    }
+    for tag in [51u8, 54, 55, 56, 58, 61, 63] {
+        // one absentee announced, none present
+        assert!(refused_cleanly(&run(&mollusk, tag, &[1u8; 150])), "tag {tag}: short payload");
+    }
+}

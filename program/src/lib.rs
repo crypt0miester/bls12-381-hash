@@ -285,99 +285,7 @@ fn process_instruction(
         // the final exponentiation that two separate calls each pay (~13k
         // CU), the 576 byte identity compare rides the memcmp syscall, and
         // every syscall-filled buffer skips its zero-init.
-        51 => {
-            let absent = payload[0] as usize;
-            let agg_end = 1 + G1_POINT;
-            let sig_end = agg_end + G2_COMPRESSED;
-            let abs_end = sig_end + 48 * absent;
-            if payload.len() < abs_end {
-                return Err(ProgramError::InvalidInstructionData);
-            }
-
-            let mut effective: [u8; G1_POINT] = payload[1..agg_end].try_into().unwrap();
-            for i in 0..absent {
-                let compressed = &payload[sig_end + i * 48..sig_end + (i + 1) * 48];
-                reject_identity(compressed)?;
-                let mut member = core::mem::MaybeUninit::<[u8; G1_POINT]>::uninit();
-                let rc = unsafe {
-                    sys::sol_curve_decompress(
-                        BLS12_381_G1_BE,
-                        compressed.as_ptr(),
-                        member.as_mut_ptr() as *mut u8,
-                    )
-                };
-                if rc != 0 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                let mut out = core::mem::MaybeUninit::<[u8; G1_POINT]>::uninit();
-                let rc = unsafe {
-                    sys::sol_curve_group_op(
-                        BLS12_381_G1_BE,
-                        OP_SUB,
-                        effective.as_ptr(),
-                        member.as_ptr() as *const u8,
-                        out.as_mut_ptr() as *mut u8,
-                    )
-                };
-                if rc != 0 {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-                // SAFETY: rc == 0 means the syscall wrote the whole point
-                effective = unsafe { out.assume_init() };
-            }
-
-            reject_identity(&effective)?;
-            reject_identity(&payload[agg_end..sig_end])?;
-            let hash = hash_to_g2(G2_RO, &payload[abs_end..])?;
-
-            // g1 and g2 sides of the two pairs, contiguous for the syscall;
-            // the signature decompresses straight into its slot
-            let mut g1s = [0u8; 2 * G1_POINT];
-            g1s[..G1_POINT].copy_from_slice(&effective);
-            g1s[G1_POINT..].copy_from_slice(&NEG_G1_GEN);
-
-            let mut g2s = core::mem::MaybeUninit::<[u8; 2 * G2_POINT]>::uninit();
-            let g2s_ptr = g2s.as_mut_ptr() as *mut u8;
-            unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), g2s_ptr, G2_POINT) };
-            let rc = unsafe {
-                sys::sol_curve_decompress(
-                    BLS12_381_G2_BE,
-                    payload[agg_end..sig_end].as_ptr(),
-                    g2s_ptr.add(G2_POINT),
-                )
-            };
-            if rc != 0 {
-                return Err(ProgramError::InvalidInstructionData);
-            }
-
-            let mut gt = core::mem::MaybeUninit::<[u8; GT]>::uninit();
-            let rc = unsafe {
-                sys::sol_curve_pairing_map(
-                    BLS12_381_PAIRING_BE,
-                    2,
-                    g1s.as_ptr(),
-                    g2s.as_ptr() as *const u8,
-                    gt.as_mut_ptr() as *mut u8,
-                )
-            };
-            if rc != 0 {
-                return Err(ProgramError::InvalidInstructionData);
-            }
-
-            let mut cmp = 0i32;
-            unsafe {
-                sys::sol_memcmp_(
-                    gt.as_ptr() as *const u8,
-                    GT_ONE.as_ptr(),
-                    GT as u64,
-                    &mut cmp,
-                )
-            };
-            if cmp != 0 {
-                return Err(ProgramError::InvalidInstructionData);
-            }
-            set_return_data(&[1]);
-        }
+        51 => min_pk_verify_with(payload, hash_to_g2)?,
         40 => {
             let out = hash_to_g1(G1_RO, payload)?;
             set_return_data(&out);
@@ -403,10 +311,8 @@ fn process_instruction(
             let out = hash_to_g2_compact_parity(G2_RO, payload)?;
             set_return_data(&out);
         }
-        // End-to-end min-pk vote verify against the compact (54),
-        // witness-free-inverse (55) and parity (56) blobs. Tag 51 stays
-        // untouched and fully inlined so its measurement is byte-stable;
-        // these share a helper and are comparable to each other.
+        // The same verify against the compact (54), witness-free-inverse
+        // (55) and parity (56) blobs.
         54 => min_pk_verify_with(payload, hash_to_g2_compact)?,
         55 => min_pk_verify_with(payload, hash_to_g2_compact_xgcd)?,
         56 => min_pk_verify_with(payload, hash_to_g2_compact_parity)?,
@@ -417,7 +323,7 @@ fn process_instruction(
             set_return_data(&out);
         }
         58 => min_pk_verify_with(payload, bls381_hash::hash_to_g2_modexp)?,
-        // Fat-witness hash_to_G2 (577 bytes), its min-pk e2e verify, and
+        // Fat-witness hash_to_G2 (837 bytes), its min-pk e2e verify, and
         // its stage prefixes (payload: stage byte, blob, msg).
         60 => {
             let out = hash_to_g2_fat(G2_RO, payload)?;
@@ -510,43 +416,58 @@ fn expect_len(payload: &[u8], len: usize) -> Result<(), ProgramError> {
     Ok(())
 }
 
-/// The tag-51 verify body with the message hash pluggable, for the compact
-/// witness variants: subtract absentees from the stored aggregate, hash the
-/// message, check the two-pair product against the baked negated generator.
-fn min_pk_verify_with(
-    payload: &[u8],
-    hash: fn(&[u8], &[u8]) -> Result<Vec<u8>, ProgramError>,
-) -> ProgramResult {
-    let absent = payload[0] as usize;
-    let agg_end = 1 + G1_POINT;
-    let sig_end = agg_end + G2_COMPRESSED;
-    let abs_end = sig_end + 48 * absent;
-    if payload.len() < abs_end {
+/// A verify payload: absent count, the stored aggregate (uncompressed),
+/// the signature, one key per absentee, then the hash input.
+struct VerifyInput<'a> {
+    aggregate: &'a [u8],
+    signature: &'a [u8],
+    absentees: &'a [u8],
+    rest: &'a [u8],
+}
+
+fn parse_verify(payload: &[u8], sig_len: usize, key_len: usize) -> Result<VerifyInput<'_>, ProgramError> {
+    let (&absent, body) = payload
+        .split_first()
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let sig_end = G1_POINT + sig_len;
+    let abs_end = sig_end + key_len * absent as usize;
+    if body.len() < abs_end {
         return Err(ProgramError::InvalidInstructionData);
     }
+    Ok(VerifyInput {
+        aggregate: &body[..G1_POINT],
+        signature: &body[G1_POINT..sig_end],
+        absentees: &body[sig_end..abs_end],
+        rest: &body[abs_end..],
+    })
+}
 
-    let mut effective: [u8; G1_POINT] = payload[1..agg_end].try_into().unwrap();
-    for i in 0..absent {
-        let compressed = &payload[sig_end + i * 48..sig_end + (i + 1) * 48];
-        reject_identity(compressed)?;
-        let mut member = core::mem::MaybeUninit::<[u8; G1_POINT]>::uninit();
-        let rc = unsafe {
-            sys::sol_curve_decompress(
-                BLS12_381_G1_BE,
-                compressed.as_ptr(),
-                member.as_mut_ptr() as *mut u8,
-            )
+/// The stored aggregate minus the absentees, every key and the result
+/// screened for the identity; compressed keys decompress first.
+fn effective_key(input: &VerifyInput, key_len: usize) -> Result<[u8; G1_POINT], ProgramError> {
+    let mut effective: [u8; G1_POINT] = input.aggregate.try_into().unwrap();
+    for key in input.absentees.chunks_exact(key_len) {
+        reject_identity(key)?;
+        let member: [u8; G1_POINT] = if key_len == G1_COMPRESSED {
+            let mut out = core::mem::MaybeUninit::<[u8; G1_POINT]>::uninit();
+            let rc = unsafe {
+                sys::sol_curve_decompress(BLS12_381_G1_BE, key.as_ptr(), out.as_mut_ptr() as *mut u8)
+            };
+            if rc != 0 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            // SAFETY: rc == 0 means the syscall wrote the whole point
+            unsafe { out.assume_init() }
+        } else {
+            key.try_into().unwrap()
         };
-        if rc != 0 {
-            return Err(ProgramError::InvalidInstructionData);
-        }
         let mut out = core::mem::MaybeUninit::<[u8; G1_POINT]>::uninit();
         let rc = unsafe {
             sys::sol_curve_group_op(
                 BLS12_381_G1_BE,
                 OP_SUB,
                 effective.as_ptr(),
-                member.as_ptr() as *const u8,
+                member.as_ptr(),
                 out.as_mut_ptr() as *mut u8,
             )
         };
@@ -556,27 +477,35 @@ fn min_pk_verify_with(
         // SAFETY: rc == 0 means the syscall wrote the whole point
         effective = unsafe { out.assume_init() };
     }
-
     reject_identity(&effective)?;
-    reject_identity(&payload[agg_end..sig_end])?;
-    let hash_point = hash(G2_RO, &payload[abs_end..])?;
+    Ok(effective)
+}
 
+/// e(effective, H) * e(-g1_gen, sig) == 1 as one two-pair product: the
+/// pairs share the final exponentiation that two separate calls each pay
+/// (~13k CU), the negated generator is baked in, a compressed signature
+/// decompresses straight into its slot, and the 576-byte identity compare
+/// rides the memcmp syscall.
+fn pairing_check(effective: &[u8; G1_POINT], hash_point: &[u8], signature: &[u8]) -> ProgramResult {
+    let hash_point: &[u8; G2_POINT] = hash_point
+        .try_into()
+        .map_err(|_| ProgramError::InvalidInstructionData)?;
     let mut g1s = [0u8; 2 * G1_POINT];
-    g1s[..G1_POINT].copy_from_slice(&effective);
+    g1s[..G1_POINT].copy_from_slice(effective);
     g1s[G1_POINT..].copy_from_slice(&NEG_G1_GEN);
 
     let mut g2s = core::mem::MaybeUninit::<[u8; 2 * G2_POINT]>::uninit();
     let g2s_ptr = g2s.as_mut_ptr() as *mut u8;
     unsafe { core::ptr::copy_nonoverlapping(hash_point.as_ptr(), g2s_ptr, G2_POINT) };
-    let rc = unsafe {
-        sys::sol_curve_decompress(
-            BLS12_381_G2_BE,
-            payload[agg_end..sig_end].as_ptr(),
-            g2s_ptr.add(G2_POINT),
-        )
-    };
-    if rc != 0 {
-        return Err(ProgramError::InvalidInstructionData);
+    if signature.len() == G2_COMPRESSED {
+        let rc = unsafe {
+            sys::sol_curve_decompress(BLS12_381_G2_BE, signature.as_ptr(), g2s_ptr.add(G2_POINT))
+        };
+        if rc != 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+    } else {
+        unsafe { core::ptr::copy_nonoverlapping(signature.as_ptr(), g2s_ptr.add(G2_POINT), G2_POINT) };
     }
 
     let mut gt = core::mem::MaybeUninit::<[u8; GT]>::uninit();
@@ -592,16 +521,8 @@ fn min_pk_verify_with(
     if rc != 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
-
     let mut cmp = 0i32;
-    unsafe {
-        sys::sol_memcmp_(
-            gt.as_ptr() as *const u8,
-            GT_ONE.as_ptr(),
-            GT as u64,
-            &mut cmp,
-        )
-    };
+    unsafe { sys::sol_memcmp_(gt.as_ptr() as *const u8, GT_ONE.as_ptr(), GT as u64, &mut cmp) };
     if cmp != 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -609,69 +530,27 @@ fn min_pk_verify_with(
     Ok(())
 }
 
-/// Tag 63 body: absent count, aggregate, signature (192 bytes), absentee
-/// keys (96 bytes each), fat blob, message.
+/// The min-pk verify with the message hash pluggable: compressed signature
+/// and absentee keys.
+fn min_pk_verify_with(
+    payload: &[u8],
+    hash: fn(&[u8], &[u8]) -> Result<Vec<u8>, ProgramError>,
+) -> ProgramResult {
+    let input = parse_verify(payload, G2_COMPRESSED, G1_COMPRESSED)?;
+    reject_identity(input.signature)?;
+    let effective = effective_key(&input, G1_COMPRESSED)?;
+    let hash_point = hash(G2_RO, input.rest)?;
+    pairing_check(&effective, &hash_point, input.signature)
+}
+
+/// Tag 63: the fat verify with the signature (192 bytes) and absentee keys
+/// (96 bytes each) uncompressed.
 fn min_pk_verify_uncompressed(payload: &[u8]) -> ProgramResult {
-    let absent = payload[0] as usize;
-    let agg_end = 1 + G1_POINT;
-    let sig_end = agg_end + G2_POINT;
-    let abs_end = sig_end + G1_POINT * absent;
-    if payload.len() < abs_end {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
-    let mut g1s = [0u8; 2 * G1_POINT];
-    g1s[..G1_POINT].copy_from_slice(&payload[1..agg_end]);
-    g1s[G1_POINT..].copy_from_slice(&NEG_G1_GEN);
-    for i in 0..absent {
-        let member = &payload[sig_end + i * G1_POINT..sig_end + (i + 1) * G1_POINT];
-        reject_identity(member)?;
-        let mut out = core::mem::MaybeUninit::<[u8; G1_POINT]>::uninit();
-        let rc = unsafe {
-            sys::sol_curve_group_op(
-                BLS12_381_G1_BE,
-                OP_SUB,
-                g1s.as_ptr(),
-                member.as_ptr(),
-                out.as_mut_ptr() as *mut u8,
-            )
-        };
-        if rc != 0 {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        // SAFETY: rc == 0 means the syscall wrote the whole point
-        g1s[..G1_POINT].copy_from_slice(unsafe { &out.assume_init() });
-    }
-
-    reject_identity(&g1s[..G1_POINT])?;
-    reject_identity(&payload[agg_end..sig_end])?;
-    let hash_point = hash_to_g2_fat_for_pairing(G2_RO, &payload[abs_end..])?;
-    let mut g2s = [0u8; 2 * G2_POINT];
-    g2s[..G2_POINT].copy_from_slice(&hash_point);
-    g2s[G2_POINT..].copy_from_slice(&payload[agg_end..sig_end]);
-
-    let mut gt = core::mem::MaybeUninit::<[u8; GT]>::uninit();
-    let rc = unsafe {
-        sys::sol_curve_pairing_map(
-            BLS12_381_PAIRING_BE,
-            2,
-            g1s.as_ptr(),
-            g2s.as_ptr(),
-            gt.as_mut_ptr() as *mut u8,
-        )
-    };
-    if rc != 0 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let mut cmp = 0i32;
-    unsafe {
-        sys::sol_memcmp_(gt.as_ptr() as *const u8, GT_ONE.as_ptr(), GT as u64, &mut cmp)
-    };
-    if cmp != 0 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    set_return_data(&[1]);
-    Ok(())
+    let input = parse_verify(payload, G2_POINT, G1_POINT)?;
+    reject_identity(input.signature)?;
+    let effective = effective_key(&input, G1_POINT)?;
+    let hash_point = hash_to_g2_fat_for_pairing(G2_RO, input.rest)?;
+    pairing_check(&effective, &hash_point, input.signature)
 }
 
 /// Refuse the point at infinity by its encoding flag (0x40 in the first

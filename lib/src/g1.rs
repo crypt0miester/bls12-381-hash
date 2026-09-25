@@ -22,6 +22,9 @@ const H_EFF: u64 = 0xd201000000010001;
 pub(crate) fn expand_message_xmd(dst: &[u8], msg: &[u8]) -> [[u8; 32]; 4] {
     use solana_sha256_hasher::hashv;
 
+    let long = crate::dst::oversize(dst);
+    let dst = long.as_ref().map_or(dst, |h| &h[..]);
+
     let z_pad = [0u8; 64];
     let l_i_b = [0u8, 128];
     let dst_len = [dst.len() as u8];
@@ -461,6 +464,8 @@ fn iso_map_witnessed(
 
 /// Single-element hash_to_field for the NU (encode_to_curve) suite.
 fn hash_to_field_nu(dst: &[u8], msg: &[u8]) -> FieldElem {
+    let long = crate::dst::oversize(dst);
+    let dst = long.as_ref().map_or(dst, |h| &h[..]);
     use solana_sha256_hasher::hashv;
     let z_pad = [0u8; 64];
     let l_i_b = [0u8, 64];
@@ -559,13 +564,15 @@ pub mod witness {
         }
     }
 
-    /// Correctness guard: the bare Montgomery reduction must equal the general
-    /// multiply by ONE at arbitrary points, edge cases included.
+    /// Correctness guard for the fixed-constant multipliers and the small
+    /// linear combinations, against mont_mul and add_mod chains.
     pub fn fixed_selftest() {
         crate::fp::fixed::selftest();
         crate::fp::wide_selftest();
     }
 
+    /// Correctness guard: the bare Montgomery reduction must equal the general
+    /// multiply by ONE at arbitrary points, edge cases included.
     pub fn redc_selftest() {
         use crate::consts_g1::MODULUS;
         let one: Fp = [1, 0, 0, 0, 0, 0];

@@ -59,6 +59,8 @@ const _: () = assert!(194 + W_TV2 + 3 * 96 == W_TOTAL);
 pub(crate) fn expand_message_xmd_g2(dst: &[u8], msg: &[u8]) -> [[u8; 32]; 8] {
     use solana_sha256_hasher::hashv;
 
+    let long = crate::dst::oversize(dst);
+    let dst = long.as_ref().map_or(dst, |h| &h[..]);
     let n = dst.len();
     // b0 = H(Z_pad || msg || l_i_b || 0 || dst || len)
     let mut tail = [0u8; 4 + 255];
@@ -620,6 +622,8 @@ pub(crate) fn clear_cofactor(p: &[u8; POINT]) -> Result<[u8; POINT], ProgramErro
 /// Single-element hash_to_field for the NU (encode_to_curve) suite.
 fn hash_to_field_nu(dst: &[u8], msg: &[u8]) -> Elem2 {
     use solana_sha256_hasher::hashv;
+    let long = crate::dst::oversize(dst);
+    let dst = long.as_ref().map_or(dst, |h| &h[..]);
     let z_pad = [0u8; 64];
     let l_i_b = [0u8, 128];
     let dst_len = [dst.len() as u8];
@@ -1156,21 +1160,30 @@ pub(crate) fn probe_pin(x: &Fp2, branch2: bool) -> Fp2 {
 }
 
 pub fn hash_to_g2_fat(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
-    hash_to_g2_fat_prefix(dst, 3, payload)
+    fat_pipeline(dst, payload, FAT_FULL, true)
 }
 
 /// hash_to_g2_fat for a caller that feeds the point to the pairing
 /// syscall, which subgroup-checks its G2 inputs: the trailing validate
 /// only repeats that check.
 pub fn hash_to_g2_fat_for_pairing(dst: &[u8], payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
-    hash_to_g2_fat_prefix(dst, 4, payload)
+    fat_pipeline(dst, payload, FAT_FULL, false)
 }
 
-/// Cumulative stage prefixes: 0 hash_to_field, 1 the x pins, 2 both maps
-/// on E and their sum, 3 the full hash, 4 the full hash without the final
-/// validate
+/// Cumulative stage prefixes for stage by stage CU: 0 hash_to_field, 1 the
+/// x pins, 2 both maps on E and their sum, 3 the full hash
 #[doc(hidden)]
 pub fn hash_to_g2_fat_prefix(dst: &[u8], stage: u8, payload: &[u8]) -> Result<Vec<u8>, ProgramError> {
+    if stage > FAT_FULL {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    fat_pipeline(dst, payload, stage, true)
+}
+
+/// The last stage: the whole hash
+const FAT_FULL: u8 = 3;
+
+fn fat_pipeline(dst: &[u8], payload: &[u8], stage: u8, validate: bool) -> Result<Vec<u8>, ProgramError> {
     let (wits, msg) = split_witness(payload, FAT_TOTAL)?;
     let flags = wits[0];
     if flags > 3 {
@@ -1213,7 +1226,7 @@ pub fn hash_to_g2_fat_prefix(dst: &[u8], stage: u8, payload: &[u8]) -> Result<Ve
         return Ok(sum.to_vec());
     }
     let cleared = clear_cofactor(&sum)?;
-    if stage == 3 {
+    if validate {
         g2_validate(&cleared)?;
     }
     Ok(cleared.to_vec())
@@ -1660,9 +1673,10 @@ pub mod witness {
         generate_compact_parity_steered(msg, 0)
     }
 
-    /// The 577-byte fat blob: flags, then per map x (Montgomery), the
+    /// The 837-byte fat blob: flags, per map x (Montgomery), the
     /// sgn0-correct root y (canonical) and sigma = 4 / (x - x_k)
-    /// (Montgomery).
+    /// (Montgomery), then per field element its Montgomery form and
+    /// quotient.
     pub fn generate_fat(msg: &[u8]) -> Vec<u8> {
         generate_fat_steered(msg, 0)
     }
@@ -1673,7 +1687,8 @@ pub mod witness {
     /// image on E, and the add syscall must refuse it.
     #[doc(hidden)]
     pub fn generate_fat_steered(msg: &[u8], steer: u8) -> Vec<u8> {
-        let u = hash_to_field_g2(crate::dst::G2_RO, msg);
+        let blocks = expand_message_xmd_g2(crate::dst::G2_RO, msg);
+        let u = hash_to_field_from_blocks(&blocks);
         let four = Fp2 { c0: FOUR, c1: ZERO };
         let mut blob = vec![0u8];
         for i in 0..2 {
@@ -1696,48 +1711,88 @@ pub mod witness {
             push_fp2_mont(&mut blob, &y);
             push_fp2_mont(&mut blob, &sigma);
         }
-        let blocks = expand_message_xmd_g2(crate::dst::G2_RO, msg);
-        for k in 0..4 {
-            let e = &u[k / 2];
-            let mont = if k % 2 == 0 { e.mont.c0 } else { e.mont.c1 };
-            blob.extend_from_slice(&limbs_to_be(&mont));
-            blob.extend_from_slice(&field_quotient(&blocks[2 * k], &blocks[2 * k + 1]));
-        }
+        push_field_witness(&mut blob, &u, &blocks);
         assert_eq!(blob.len(), FAT_TOTAL);
         blob
     }
 
-    /// floor((hi || lo) / p) as 17 big-endian bytes, schoolbook bits
-    fn field_quotient(hi: &[u8; 32], lo: &[u8; 32]) -> [u8; FIELD_Q] {
-        use crate::fp::{geq, sub_nocheck};
-        let mut rem = ZERO;
-        let mut q = [0u64; 3];
-        for byte in hi.iter().chain(lo.iter()) {
-            for b in (0..8).rev() {
-                let mut carry = ((byte >> b) & 1) as u64;
-                for limb in rem.iter_mut() {
-                    let top = *limb >> 63;
-                    *limb = (*limb << 1) | carry;
-                    carry = top;
-                }
-                let mut qc = 0;
-                for limb in q.iter_mut() {
-                    let top = *limb >> 63;
-                    *limb = (*limb << 1) | qc;
-                    qc = top;
-                }
-                if geq(&rem, &crate::consts_g1::MODULUS) {
-                    rem = sub_nocheck(&rem, &crate::consts_g1::MODULUS);
-                    q[0] |= 1;
-                }
+    use crate::consts_g1::INV;
+
+    /// a b mod 2^192 over u64 limbs
+    const fn mul192(a: [u64; 3], b: [u64; 3]) -> [u64; 3] {
+        let mut out = [0u64; 3];
+        let mut i = 0;
+        while i < 3 {
+            let mut carry = 0u128;
+            let mut j = 0;
+            while i + j < 3 {
+                let t = (a[i] as u128) * (b[j] as u128) + (out[i + j] as u128) + carry;
+                out[i + j] = t as u64;
+                carry = t >> 64;
+                j += 1;
             }
+            i += 1;
         }
+        out
+    }
+
+    /// p^-1 mod 2^192: two Newton steps from the 64-bit inverse behind INV
+    const PINV192: [u64; 3] = {
+        let p = [MODULUS[0], MODULUS[1], MODULUS[2]];
+        let mut x = [INV.wrapping_neg(), 0, 0];
+        let mut k = 0;
+        while k < 2 {
+            // x (2 - p x)
+            let px = mul192(p, x);
+            let (l0, b0) = 2u64.overflowing_sub(px[0]);
+            let (l1, b1) = 0u64.overflowing_sub(px[1]);
+            let (l1, b1b) = l1.overflowing_sub(b0 as u64);
+            let l2 = 0u64.wrapping_sub(px[2]).wrapping_sub((b1 | b1b) as u64);
+            x = mul192(x, [l0, l1, l2]);
+            k += 1;
+        }
+        x
+    };
+    const _: () = {
+        let one = mul192([MODULUS[0], MODULUS[1], MODULUS[2]], PINV192);
+        assert!(one[0] == 1 && one[1] == 0 && one[2] == 0);
+    };
+
+    /// floor((hi || lo) / p) given u = (hi || lo) mod p: the difference is
+    /// an exact multiple of p and the quotient is below 2^136, so the low
+    /// 192 bits (all in lo) times p^-1 recover it whole
+    fn exact_quotient(lo: &[u8; 32], u: &Fp) -> [u8; FIELD_Q] {
+        let x = [
+            u64::from_be_bytes(lo[24..32].try_into().unwrap()),
+            u64::from_be_bytes(lo[16..24].try_into().unwrap()),
+            u64::from_be_bytes(lo[8..16].try_into().unwrap()),
+        ];
+        let (d0, b0) = x[0].overflowing_sub(u[0]);
+        let (d1, b1) = x[1].overflowing_sub(u[1]);
+        let (d1, b1b) = d1.overflowing_sub(b0 as u64);
+        let d2 = x[2].wrapping_sub(u[2]).wrapping_sub((b1 | b1b) as u64);
+        let q = mul192([d0, d1, d2], PINV192);
         assert!(q[2] < 256, "quotient past 136 bits");
         let mut out = [0u8; FIELD_Q];
         out[0] = q[2] as u8;
         out[1..9].copy_from_slice(&q[1].to_be_bytes());
         out[9..].copy_from_slice(&q[0].to_be_bytes());
         out
+    }
+
+    /// Per field element its Montgomery form and quotient, the tail both
+    /// fat generators share
+    fn push_field_witness(blob: &mut Vec<u8>, u: &[Elem2; 2], blocks: &[[u8; 32]; 8]) {
+        for k in 0..4 {
+            let e = &u[k / 2];
+            let (mont, canonical) = if k % 2 == 0 {
+                (e.mont.c0, e.canonical.c0)
+            } else {
+                (e.mont.c1, e.canonical.c1)
+            };
+            blob.extend_from_slice(&limbs_to_be(&mont));
+            blob.extend_from_slice(&exact_quotient(&blocks[2 * k + 1], &canonical));
+        }
     }
 
     /// The fat blob through blst's field arithmetic, byte for byte the
@@ -1796,7 +1851,6 @@ pub mod witness {
     #[cfg(feature = "blst")]
     mod blst_backend {
         use super::*;
-        use crate::consts_g1::{INV, MODULUS};
         use crate::consts_g2::{SSWU2_ELLP_A, SSWU2_XI};
         use blst::{blst_fp, blst_fp2};
 
@@ -1857,68 +1911,6 @@ pub mod witness {
             add(&add(&mul(&sqr(x), x), &mul(a, x)), b)
         }
 
-        /// a b mod 2^192 over u64 limbs
-        const fn mul192(a: [u64; 3], b: [u64; 3]) -> [u64; 3] {
-            let mut out = [0u64; 3];
-            let mut i = 0;
-            while i < 3 {
-                let mut carry = 0u128;
-                let mut j = 0;
-                while i + j < 3 {
-                    let t = (a[i] as u128) * (b[j] as u128) + (out[i + j] as u128) + carry;
-                    out[i + j] = t as u64;
-                    carry = t >> 64;
-                    j += 1;
-                }
-                i += 1;
-            }
-            out
-        }
-
-        /// p^-1 mod 2^192: two Newton steps from the 64-bit inverse behind INV
-        const PINV192: [u64; 3] = {
-            let p = [MODULUS[0], MODULUS[1], MODULUS[2]];
-            let mut x = [INV.wrapping_neg(), 0, 0];
-            let mut k = 0;
-            while k < 2 {
-                // x (2 - p x)
-                let px = mul192(p, x);
-                let (l0, b0) = 2u64.overflowing_sub(px[0]);
-                let (l1, b1) = 0u64.overflowing_sub(px[1]);
-                let (l1, b1b) = l1.overflowing_sub(b0 as u64);
-                let l2 = 0u64.wrapping_sub(px[2]).wrapping_sub((b1 | b1b) as u64);
-                x = mul192(x, [l0, l1, l2]);
-                k += 1;
-            }
-            x
-        };
-        const _: () = {
-            let one = mul192([MODULUS[0], MODULUS[1], MODULUS[2]], PINV192);
-            assert!(one[0] == 1 && one[1] == 0 && one[2] == 0);
-        };
-
-        /// floor((hi || lo) / p) given u = (hi || lo) mod p: the difference is
-        /// an exact multiple of p and the quotient is below 2^136, so the low
-        /// 192 bits (all in lo) times p^-1 recover it whole
-        fn exact_quotient(lo: &[u8; 32], u: &Fp) -> [u8; FIELD_Q] {
-            let x = [
-                u64::from_be_bytes(lo[24..32].try_into().unwrap()),
-                u64::from_be_bytes(lo[16..24].try_into().unwrap()),
-                u64::from_be_bytes(lo[8..16].try_into().unwrap()),
-            ];
-            let (d0, b0) = x[0].overflowing_sub(u[0]);
-            let (d1, b1) = x[1].overflowing_sub(u[1]);
-            let (d1, b1b) = d1.overflowing_sub(b0 as u64);
-            let d2 = x[2].wrapping_sub(u[2]).wrapping_sub((b1 | b1b) as u64);
-            let q = mul192([d0, d1, d2], PINV192);
-            assert!(q[2] < 256, "quotient past 136 bits");
-            let mut out = [0u8; FIELD_Q];
-            out[0] = q[2] as u8;
-            out[1..9].copy_from_slice(&q[1].to_be_bytes());
-            out[9..].copy_from_slice(&q[0].to_be_bytes());
-            out
-        }
-
         pub(super) fn generate_fat(msg: &[u8]) -> Vec<u8> {
             let blocks = expand_message_xmd_g2(crate::dst::G2_RO, msg);
             let u = hash_to_field_from_blocks(&blocks);
@@ -1969,18 +1961,42 @@ pub mod witness {
                 push_fp2_mont(&mut blob, &ys[i]);
                 push_fp2_mont(&mut blob, &to_mont2(&from_blst2(&sigma[i])));
             }
-            for k in 0..4 {
-                let e = &u[k / 2];
-                let (mont, canonical) = if k % 2 == 0 {
-                    (e.mont.c0, e.canonical.c0)
-                } else {
-                    (e.mont.c1, e.canonical.c1)
-                };
-                blob.extend_from_slice(&limbs_to_be(&mont));
-                blob.extend_from_slice(&exact_quotient(&blocks[2 * k + 1], &canonical));
-            }
+            push_field_witness(&mut blob, &u, &blocks);
             debug_assert_eq!(blob.len(), FAT_TOTAL);
             blob
+        }
+    }
+}
+
+/// expand_message_xmd against blst's for any DST length, the oversize rule
+/// of RFC 9380 section 5.3.3 included
+#[cfg(all(test, feature = "blst"))]
+mod expand_tests {
+    use super::expand_message_xmd_g2;
+
+    fn blst_expand(dst: &[u8], msg: &[u8], len: usize) -> alloc::vec::Vec<u8> {
+        let mut out = alloc::vec![0u8; len];
+        unsafe {
+            blst::blst_expand_message_xmd(
+                out.as_mut_ptr(),
+                len,
+                msg.as_ptr(),
+                msg.len(),
+                dst.as_ptr(),
+                dst.len(),
+            )
+        };
+        out
+    }
+
+    #[test]
+    fn expand_matches_blst_for_any_dst_length() {
+        for n in [0usize, 1, 43, 255, 256, 300, 1000] {
+            let dst: alloc::vec::Vec<u8> = (0..n).map(|i| (i * 7 + 3) as u8).collect();
+            for msg in [&b""[..], &b"abc"[..], &[0x5au8; 200][..]] {
+                assert_eq!(expand_message_xmd_g2(&dst, msg).concat(), blst_expand(&dst, msg, 256), "g2, dst {n}");
+                assert_eq!(crate::g1::expand_message_xmd(&dst, msg).concat(), blst_expand(&dst, msg, 128), "g1, dst {n}");
+            }
         }
     }
 }

@@ -69,6 +69,27 @@ fn syscall_subgroup_contract() {
         let q = G2Affine::from_uncompressed_unchecked(&off).unwrap();
         !bool::from(q.is_on_curve())
     });
+    // the group ops encode the identity with the 0x40 flag and zeros, which
+    // is what the verify fixtures' identity screens read
+    let g1 = G1Affine::generator();
+    let mut data = vec![15u8];
+    data.extend_from_slice(&g1.to_uncompressed());
+    data.extend_from_slice(&(-g1).to_uncompressed());
+    let a = mollusk.process_instruction(&Instruction::new_with_bytes(ID, &data, vec![]), &[]);
+    assert_eq!(a.return_data[0], 0, "g1 add of P and -P failed");
+    let mut id_g1 = [0u8; 96];
+    id_g1[0] = 0x40;
+    assert_eq!(&a.return_data[1..], &id_g1[..], "g1 identity encoding changed");
+    let g2 = G2Affine::generator();
+    let mut data = vec![11u8];
+    data.extend_from_slice(&g2.to_uncompressed());
+    data.extend_from_slice(&(-g2).to_uncompressed());
+    let a = mollusk.process_instruction(&Instruction::new_with_bytes(ID, &data, vec![]), &[]);
+    assert_eq!(a.return_data[0], 0, "g2 add of P and -P failed");
+    let mut id_g2 = [0u8; 192];
+    id_g2[0] = 0x40;
+    assert_eq!(&a.return_data[1..], &id_g2[..], "g2 identity encoding changed");
+
     for (left, right, side) in [(&off, &uncleared, "left"), (&uncleared, &off, "right")] {
         let mut data = vec![11u8];
         data.extend_from_slice(left);

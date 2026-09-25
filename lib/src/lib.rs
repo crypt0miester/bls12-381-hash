@@ -39,6 +39,13 @@ pub mod dst {
     pub const G2_RO: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
     pub const G1_NU: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_NU_POP_";
     pub const G2_NU: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_NU_POP_";
+
+    /// RFC 9380 section 5.3.3: a DST over 255 bytes is replaced by
+    /// SHA-256("H2C-OVERSIZE-DST-" || DST)
+    pub(crate) fn oversize(dst: &[u8]) -> Option<[u8; 32]> {
+        (dst.len() > 255)
+            .then(|| solana_sha256_hasher::hashv(&[b"H2C-OVERSIZE-DST-", dst]).to_bytes())
+    }
 }
 
 #[cfg(feature = "g1-ro")]
