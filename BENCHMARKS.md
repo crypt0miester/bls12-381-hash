@@ -95,6 +95,28 @@ steered generator ships the other branch's x with a consistent sigma and
 must abort, either root of either map reproduces the point, and 256
 messages covering all four branch combinations match blst byte for byte.
 
+## Host (off-chain)
+
+`bench/tests/host_speed.rs` (Apple M4 Max, one thread, best of five
+batches, 2026-09-25):
+
+| operation | us |
+|---|---|
+| hash_to_G2: blst / blstrs / solana-bls-signatures / zkcrypto | 92 / 93 / 95 / 251 |
+| this crate's witness generation: fat / default / parity | 347 / 368 / 292 |
+| field multiply: this crate's ps30 / blst asm | 0.048 / 0.020 |
+| blst Fp2 inverse / Fp2 square root | 1.7 / 14.9 |
+| blst sign / verify / 20-signer fast aggregate verify | 188 / 421 / 417 |
+| solana-bls-signatures sign / verify | 182 / 543 |
+
+Hash-to-curve off chain belongs to blst (asm), directly or through
+blstrs or solana-bls-signatures, which all measure the same. This crate
+has no host hash, only witness generators, and those spend nearly all of
+their time in Fermat square roots and inverses on the portable ps30
+multiplier (about 7,300 multiplies per fat witness). Running the same
+generator on blst's public field API (one Fp2 inverse and one or two Fp2
+square roots per map, one more inverse for sigma) models at ~60 us.
+
 ## Compact witness layouts
 
 Three G2 layouts restructure the same checks to shrink the blob for
